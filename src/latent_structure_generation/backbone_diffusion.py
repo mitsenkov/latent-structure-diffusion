@@ -650,6 +650,71 @@ def pad_or_crop_backbone(
     return coords_fixed, mask_fixed, truncated
 
 
+def build_overlapping_backbone_chunks(
+    dataframe: pd.DataFrame,
+    split: str,
+    max_length: int = 256,
+    stride: int = 128,
+    record_id_column: str = "name",
+) -> pd.DataFrame:
+    """Expand long chains into overlapping fixed-length backbone chunks.
+
+    The input is expected to be chain-level rows. Each output row keeps a
+    ``parent_chain_id`` so downstream code can track provenance and avoid
+    leakage across splits.
+    """
+
+    if max_length <= 0:
+        raise ValueError("max_length must be positive.")
+    if stride <= 0:
+        raise ValueError("stride must be positive.")
+    if stride > max_length:
+        raise ValueError("stride must be less than or equal to max_length.")
+
+    rows: list[dict[str, Any]] = []
+    for _, row in dataframe.reset_index(drop=True).iterrows():
+        coords, residue_mask = extract_backbone_from_coords_dict(row["coords"])
+        parent_chain_id = str(row[record_id_column])
+        seq_value = str(row["seq"]) if "seq" in row.index else ""
+        n_res = int(coords.shape[0])
+
+        if n_res <= max_length:
+            chunk_ranges = [(0, n_res)]
+        else:
+            starts = list(range(0, n_res - max_length + 1, stride))
+            final_start = n_res - max_length
+            if not starts or starts[-1] != final_start:
+                starts.append(final_start)
+            chunk_ranges = [(start, min(start + max_length, n_res)) for start in starts]
+
+        chunk_count = len(chunk_ranges)
+        for chunk_index, (start, end) in enumerate(chunk_ranges):
+            chunk_seq = seq_value[start:end] if seq_value else ""
+            chunk_id = f"{parent_chain_id}__chunk{chunk_index:03d}_{start:04d}_{end:04d}"
+            chunk_row = row.to_dict()
+            chunk_row.update(
+                {
+                    "name": parent_chain_id,
+                    "parent_chain_id": parent_chain_id,
+                    "chunk_id": chunk_id,
+                    "chunk_index": int(chunk_index),
+                    "chunk_start": int(start),
+                    "chunk_end": int(end),
+                    "chunk_length": int(end - start),
+                    "chunk_count": int(chunk_count),
+                    "coords": {
+                        atom: np.asarray(coords[start:end, atom_index, :], dtype=np.float32).copy()
+                        for atom_index, atom in enumerate(BACKBONE_ATOMS)
+                    },
+                    "seq": chunk_seq,
+                    "split": split,
+                }
+            )
+            rows.append(chunk_row)
+
+    return pd.DataFrame(rows)
+
+
 class BackboneDataset(Dataset):
     """Padded backbone coordinate dataset built from the provided CATH dataframe."""
 
@@ -673,11 +738,21 @@ class BackboneDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.dataframe.iloc[index]
         coords, residue_mask = extract_backbone_from_coords_dict(row["coords"])
+        source_length = int(coords.shape[0])
         coords, residue_mask, truncated = pad_or_crop_backbone(coords, residue_mask, self.max_length)
         seq_value = row["seq"] if "seq" in row.index else ""
+        parent_chain_id = row["parent_chain_id"] if "parent_chain_id" in row.index else row[self.record_id_column]
         return {
             "record_id": row[self.record_id_column],
             "split": row["split"],
+            "parent_chain_id": parent_chain_id,
+            "chunk_id": row["chunk_id"] if "chunk_id" in row.index else row[self.record_id_column],
+            "chunk_index": int(row["chunk_index"]) if "chunk_index" in row.index else 0,
+            "chunk_start": int(row["chunk_start"]) if "chunk_start" in row.index else 0,
+            "chunk_end": int(row["chunk_end"]) if "chunk_end" in row.index else source_length,
+            "chunk_length": int(row["chunk_length"]) if "chunk_length" in row.index else source_length,
+            "chunk_count": int(row["chunk_count"]) if "chunk_count" in row.index else 1,
+            "source_length": source_length,
             "coords": torch.tensor(coords, dtype=torch.float32),
             "mask": torch.tensor(residue_mask.astype(np.float32), dtype=torch.float32),
             "length": len(seq_value),
@@ -699,6 +774,14 @@ def collate_backbone_examples(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "length": torch.tensor([item["length"] for item in batch], dtype=torch.long),
         "real_length": torch.tensor([item["real_length"] for item in batch], dtype=torch.long),
         "truncated": torch.tensor([item["truncated"] for item in batch], dtype=torch.bool),
+        "parent_chain_id": [item["parent_chain_id"] for item in batch],
+        "chunk_id": [item["chunk_id"] for item in batch],
+        "chunk_index": torch.tensor([item["chunk_index"] for item in batch], dtype=torch.long),
+        "chunk_start": torch.tensor([item["chunk_start"] for item in batch], dtype=torch.long),
+        "chunk_end": torch.tensor([item["chunk_end"] for item in batch], dtype=torch.long),
+        "chunk_length": torch.tensor([item["chunk_length"] for item in batch], dtype=torch.long),
+        "chunk_count": torch.tensor([item["chunk_count"] for item in batch], dtype=torch.long),
+        "source_length": torch.tensor([item["source_length"] for item in batch], dtype=torch.long),
     }
 
 

@@ -16,6 +16,7 @@ dependencies = [
     "biopython>=1.83",
     "gemmi>=0.6.5",
     "tqdm>=4.66",
+    "ipykernel>=7.2.0",
 ]
 
 [tool.setuptools.packages.find]
