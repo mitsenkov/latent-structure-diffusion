@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "latent-structure-diffusion"
+version = "0.0.1"
+description = "Colab-friendly protein backbone diffusion baseline."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "requests>=2.32",
+    "matplotlib>=3.8",
+    "scikit-learn>=1.4",
+    "biopython>=1.83",
+    "gemmi>=0.6.5",
+    "tqdm>=4.66",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
