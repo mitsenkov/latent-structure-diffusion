@@ -866,6 +866,44 @@ def build_normalization_stats(coords: torch.Tensor, mask: torch.Tensor) -> Backb
     return BackboneNormalizationStats(mean=mean.detach().cpu(), std=std.detach().cpu())
 
 
+def build_normalization_stats_from_dataframe(
+    dataframe: pd.DataFrame,
+    record_id_column: str = "name",
+) -> BackboneNormalizationStats:
+    """Compute train-only mean and standard deviation from raw chain rows.
+
+    This uses every real residue in the dataframe and does not depend on
+    fixed-length padding or chunking, which keeps the normalization statistics
+    aligned with the underlying chain distribution.
+    """
+
+    if dataframe.empty:
+        raise ValueError("Cannot compute normalisation stats from an empty dataframe.")
+
+    sum_xyz = torch.zeros(3, dtype=torch.float32)
+    sum_sq_xyz = torch.zeros(3, dtype=torch.float32)
+    count = 0
+
+    for _, row in dataframe.iterrows():
+        coords, residue_mask = extract_backbone_from_coords_dict(row["coords"])
+        coords_t = torch.tensor(coords[None], dtype=torch.float32)
+        mask_t = torch.tensor(residue_mask[None], dtype=torch.float32)
+        centred = centre_coordinates(coords_t, mask_t)[0]
+        real = centred[mask_t[0].bool()].reshape(-1, 3)
+        if real.numel() == 0:
+            record_id = row[record_id_column] if record_id_column in row.index else "<unknown>"
+            raise ValueError(f"Cannot compute normalisation stats from empty record {record_id!r}.")
+
+        sum_xyz += real.sum(dim=0).cpu()
+        sum_sq_xyz += (real.pow(2)).sum(dim=0).cpu()
+        count += int(real.shape[0])
+
+    mean = sum_xyz / max(count, 1)
+    var = sum_sq_xyz / max(count, 1) - mean.pow(2)
+    std = torch.sqrt(var.clamp_min(1e-6))
+    return BackboneNormalizationStats(mean=mean, std=std)
+
+
 def structure_validity_report(coords: torch.Tensor, mask: torch.Tensor) -> pd.DataFrame:
     """Return a simple per-structure sanity table for a batch."""
 
