@@ -340,6 +340,282 @@ Local validation performed here:
 - `python -m json.tool notebooks/protein_backbone_diffusion_v3.ipynb` passed
 - all V3 notebook code cells compile with Python `compile(...)`
 
-Follow-up setup fix: the V3 runtime cell now makes Google Drive mounting optional for PyCharm/IDE execution. `BACKBONE_DIFFUSION_MOUNT_DRIVE=0` skips Drive mounting and disables table writes by default; `BACKBONE_DIFFUSION_SAVE_TABLES=0` disables CSV/Parquet table artifacts explicitly; `BACKBONE_DIFFUSION_SAVE_TABLES=1` re-enables table writes even without Drive. The default artifact root remains repo-local at `results/v3/`.
+Follow-up setup fix: the V3 runtime cell now makes Google Drive mounting optional for PyCharm/IDE execution. `BACKBONE_DIFFUSION_MOUNT_DRIVE=0` skips Drive mounting and disables table writes by default; `BACKBONE_DIFFUSION_SAVE_TABLES=0` disables CSV/Parquet table artifacts explicitly; `BACKBONE_DIFFUSION_SAVE_TABLES=1` re-enables table writes even without Drive. The artifact root now uses Google Drive when mounted successfully and falls back to repo-local `results/v3/` otherwise.
 
-Local execution was not completed in this workspace because the available Python environment does not have `torch` or `nbformat` installed. The next step is to run the V3 notebook in the same Colab/GPU environment used for V1 and V2, then replace this plan section with the measured V3 training and structural results.
+Local execution was not completed in this workspace because the available Python environment does not have `torch` or `nbformat` installed. V3 was then run in Google Colab on an NVIDIA L4, and the extracted artifacts are now under `results/v3/`.
+
+## V3 report: Atom-graph denoiser evaluation
+
+V3 is complete in `notebooks/protein_backbone_diffusion_v3.ipynb`, with artifacts extracted under `results/v3/`. The uploaded zip was extracted and removed after extraction.
+
+### Setup
+
+V3 preserved the V2 DDPM data pipeline, splits, masking, train-only coordinate normalization, sampling procedure, and diagnostics. The main architecture change was replacing the V2 flattened 1D residual convolutional denoiser with `BackboneAtomGraphDenoiser`, a local atom-graph model.
+
+Key run settings:
+
+| Item | V3 value |
+|---|---:|
+| Device | NVIDIA L4 |
+| Seed | 42 |
+| Max sequence length | 256 |
+| Backbone atoms | N, CA, C, O |
+| Train chains | 18,024 |
+| Train chunks | 27,706 |
+| Validation chains | 608 |
+| Test chains | 1,120 |
+| Timesteps | 100 |
+| Epochs | 5 |
+| Batch size | 32 |
+| Optimizer | Adam |
+| Learning rate | 0.001 |
+| Model type | BackboneAtomGraphDenoiser |
+| Hidden dimension | 192 |
+| Layers | 4 |
+| Model parameters | 1,679,843 |
+
+### Training results
+
+V3 trained substantially slower than V2 and achieved worse noise-prediction losses.
+
+| Version | Best epoch | Best validation loss | Test loss at best epoch | Mean seconds per epoch |
+|---|---:|---:|---:|---:|
+| V2 | 4 | 0.0975 | 0.0992 | 13.7 |
+| V3 | 4 | 0.1373 | 0.1393 | 124.3 |
+
+The V3 epoch time was about 9.1x slower than V2. Best validation loss was about 41% worse than V2. This means the atom-graph denoiser was not a better optimizer for the DDPM noise objective under the same five-epoch schedule.
+
+V3 training history:
+
+| Epoch | Train loss | Validation loss | Test loss | Validation x0 RMSE | Test x0 RMSE | Seconds |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.2305 | 0.1577 | 0.1615 | 0.2079 | 0.2026 | 122.3 |
+| 2 | 0.1631 | 0.1460 | 0.1507 | 0.1957 | 0.1949 | 124.8 |
+| 3 | 0.1560 | 0.1518 | 0.1559 | 0.2028 | 0.1960 | 124.8 |
+| 4 | 0.1500 | 0.1373 | 0.1393 | 0.1914 | 0.1907 | 124.8 |
+| 5 | 0.1442 | 0.1382 | 0.1391 | 0.1898 | 0.1926 | 124.8 |
+
+### Fixed-timestep diagnostics
+
+V3 improved the very-low-noise timestep-1 loss relative to V2, but was worse at every other checked timestep. The high-noise end matters most for sampling because reverse diffusion starts from noise; at timestep 100, V3 validation x0 RMSE was 0.3409 versus V2's 0.2771.
+
+| Timestep | V2 validation loss | V3 validation loss | V2 validation x0 RMSE | V3 validation x0 RMSE |
+|---:|---:|---:|---:|---:|
+| 1 | 0.7993 | 0.6542 | 0.0089 | 0.0081 |
+| 5 | 0.2768 | 0.3716 | 0.0264 | 0.0306 |
+| 10 | 0.1769 | 0.2833 | 0.0423 | 0.0535 |
+| 25 | 0.1066 | 0.1575 | 0.0832 | 0.1011 |
+| 50 | 0.0736 | 0.0957 | 0.1452 | 0.1657 |
+| 75 | 0.0549 | 0.0754 | 0.2050 | 0.2402 |
+| 100 | 0.0439 | 0.0664 | 0.2771 | 0.3409 |
+
+This supports the visual observation that V3 did not solve reverse-sampling quality. It was especially weaker in the high-noise regime used at the start of generation.
+
+### Structural sample quality
+
+The structural metrics are mixed. V3 improved several mean distances relative to V2, but the generated structures remained far from real proteins and still failed the most important CA-band quality check.
+
+| Metric | Real mean | V2 generated | V3 generated | V3 minus V2 | Interpretation |
+|---|---:|---:|---:|---:|---|
+| Adjacent CA distance | 3.810 | 3.099 | 3.531 | +0.432 | Better and closer to 3.8 A. |
+| Adjacent CA in-band fraction | 0.999 | 0.265 | 0.258 | -0.007 | Slightly worse; still broken. |
+| N-CA distance | 1.464 | 1.212 | 1.360 | +0.148 | Better and closer to real. |
+| CA-C distance | 1.525 | 1.254 | 1.361 | +0.108 | Better but still short. |
+| C-O distance | 1.229 | 1.027 | 1.209 | +0.182 | Much closer to real. |
+| C-N distance | 1.330 | 1.196 | 1.233 | +0.037 | Slightly better but still short. |
+| Radius of gyration | 16.213 | 7.148 | 8.045 | +0.897 | Better, but still about half of real. |
+
+V3 reduced the collapse flag rate but did not eliminate collapse:
+
+| Version | Samples | Collapse fraction | Collapse count | Poor CA-band fraction | Poor CA-band count |
+|---|---:|---:|---:|---:|---:|
+| V2 | 32 | 0.969 | 31/32 | 1.000 | 32/32 |
+| V3 | 32 | 0.625 | 20/32 | 1.000 | 32/32 |
+
+The collapse fraction improved from 31/32 to 20/32, but all generated samples still failed the adjacent-CA band-quality threshold. The generated adjacent-CA in-band fraction was essentially unchanged and slightly worse: 0.258 for V3 versus 0.265 for V2.
+
+### Interpretation
+
+The original qualitative conclusion mostly holds, with nuance. V3 was not a useful architecture upgrade in terms of end-to-end sample quality. It was about 9x slower per epoch, had worse validation/test denoising loss, and generated samples still looked collapsed and non-protein-like. However, the atom-graph representation did move several mean bond metrics and radius of gyration in the right direction, and it reduced the binary collapse count from 31/32 to 20/32.
+
+The key failure is that V3 did not improve the decisive local CA geometry metric. Every generated sample still had poor CA-band quality. This means atom-level local message passing alone is not enough. The model needs an objective or sampling procedure that explicitly rewards valid protein geometry.
+
+### V3 claim
+
+```text
+I tested an atom-level local graph denoiser as a pragmatic geometry-aware V3 architecture. It preserved the DDPM pipeline and improved some mean bond-length and compactness metrics, but it trained about 9x slower, achieved worse denoising losses, and still produced structurally invalid samples: 20/32 were collapsed and 32/32 failed the adjacent-CA band-quality check. This suggests the next step should be geometry-augmented denoising loss, not another architecture-only tweak.
+```
+
+## V3 interpretation and V3b next-step note
+
+The final Colab outputs confirm the planning direction.
+
+The original roadmap used `V3.1` to mean atom-level representation. That part has already been implemented inside V3: each backbone atom is treated as a node with atom-type, residue-position, timestep, coordinate, and mask features. Therefore, the next follow-up should be called `V3b` or `V3.7` rather than reusing `V3.1`, unless the roadmap is deliberately renumbered.
+
+The working recommendation is not to keep tweaking the V3 architecture itself. If atom nodes plus local message passing do not fix collapse, and training is much slower than V1/V2, then the missing piece is probably not just "better local representation."
+
+The obvious missing ingredient is explicit protein geometry supervision during denoising.
+
+Right now the model is trained mostly to:
+
+```text
+predict Gaussian noise correctly under a masked MSE
+```
+
+That objective does not directly say:
+
+```text
+adjacent CA should be about 3.8 A
+N-CA / CA-C / C-O / C-N bonds should be realistic
+the chain should not collapse globally
+```
+
+So the recommended next step is V3b, not V4 yet.
+
+### V3b proposal: geometry-augmented denoising loss
+
+Use the faster V2 flattened denoiser first, or optionally keep the V3 atom denoiser for comparison, and add auxiliary geometry losses on predicted clean coordinates.
+
+During training the notebook already computes:
+
+```python
+x0_pred = predict_x0(x_t, t, pred_noise, schedule['alpha_bars'])
+```
+
+That gives an estimated clean backbone. Add geometry terms on `x0_pred`:
+
+```text
+total_loss =
+    noise_mse
+    + lambda_bond * bond_length_loss(x0_pred)
+    + lambda_ca * adjacent_ca_loss(x0_pred)
+    + optional lambda_rg * radius/compactness_regularizer
+```
+
+Start simple:
+
+| Term | Initial weight |
+|---|---:|
+| Noise prediction loss | 1.0 |
+| Backbone bond loss | 0.05 or 0.1 |
+| Adjacent CA loss | 0.05 or 0.1 |
+| Radius/compactness loss | omit initially |
+
+The most defensible additions are:
+
+| Loss | Target |
+|---|---|
+| Adjacent CA distance loss | Penalize valid adjacent CA distances away from about 3.8 A. |
+| N-CA bond loss | Penalize distances away from about 1.46 A. |
+| CA-C bond loss | Penalize distances away from about 1.53 A. |
+| C-O bond loss | Penalize distances away from about 1.23 A. |
+| Adjacent C-N peptide bond loss | Penalize distances away from about 1.33 A. |
+
+Delay pairwise or radius-of-gyration regularization at first. Radius regularization can be brittle because it risks forcing all generated proteins toward one global size.
+
+### Why V4 should wait
+
+An EGNN gives a better inductive bias:
+
+```text
+translation/rotation equivariance
+coordinate-aware message passing
+better geometric symmetry handling
+```
+
+But an EGNN does not automatically enforce protein bond lengths. It can still learn a denoising objective and sample collapsed structures if the loss and sampling setup do not constrain valid geometry.
+
+Geometry losses are useful because they carry forward:
+
+```text
+V3b: flattened or atom model + geometry losses
+V4: EGNN + same geometry losses
+future: guidance/projection/internal-coordinate model
+```
+
+Recommended sequence:
+
+1. Complete the V3 report once the final Colab metrics are available.
+2. Treat current V3 as a negative or mixed result if the metrics confirm that atom-level local message passing did not improve collapse.
+3. Create V3b with geometry-augmented training loss.
+4. Use the faster V2 flattened denoiser first, because it trains much faster and can test the geometry-loss hypothesis quickly.
+5. If geometry losses improve sample metrics, then V4 EGNN is justified as "same protein-aware objective, stronger equivariant architecture."
+6. If geometry losses do not improve sampling, the issue is likely deeper: raw Cartesian DDPM sampling may need guidance, projection, or internal-coordinate generation.
+
+The strongest project story would be:
+
+```text
+V2 showed collapse.
+V3 showed atom-level local message passing alone did not fix collapse.
+V3b added explicit protein geometry losses, which are architecture-independent and can carry into EGNN-style V4.
+```
+
+## V3b implementation status: Geometry-augmented V2 baseline
+
+V3b has been created as `notebooks/protein_backbone_diffusion_v3b.ipynb`. It intentionally starts from V2 rather than V3, because V2 is much faster and is the stronger baseline for testing whether explicit geometry losses help.
+
+The notebook preserves the V2 DDPM setup:
+
+- train/validation/test split handling
+- train-chain chunking
+- masking
+- train-only coordinate normalization
+- 100-step linear noise schedule
+- flattened `BackboneDenoiser`
+- reverse sampling procedure
+- V2-style fixed-timestep diagnostics and generated structural metrics
+
+The main implementation change is in training. After the model predicts noise, V3b reconstructs:
+
+```python
+x0_pred = predict_x0(x_t, t, pred_noise, schedule['alpha_bars'])
+```
+
+It then converts `x0_pred` from normalized flattened coordinates back to `B x L x 4 x 3` Angstrom coordinates before measuring geometry. The total objective is:
+
+```text
+total_loss =
+    1.0 * noise_loss
+    + 0.05 * backbone_bond_geometry_loss
+    + 0.05 * adjacent_ca_geometry_loss
+```
+
+The geometry targets are:
+
+| Loss component | Target |
+|---|---:|
+| Adjacent CA-CA | 3.80 A |
+| N-CA | 1.46 A |
+| CA-C | 1.53 A |
+| C-O | 1.23 A |
+| Adjacent C-N | 1.33 A |
+
+Mask handling:
+
+- intra-residue bond losses use the valid residue mask
+- adjacent CA-CA and adjacent C-N losses use `mask[:, :-1] & mask[:, 1:]`
+- padded residues do not contribute to geometry losses
+
+V3b uses the same optional Google Drive artifact behavior as V3: when Drive mounts successfully, artifacts go under `MyDrive/latent-structure-generation/results/v3b/`; otherwise the notebook falls back to repo-local `results/v3b/`. `BACKBONE_DIFFUSION_MOUNT_DRIVE=0` skips Drive mounting, `BACKBONE_DIFFUSION_SAVE_TABLES=0` disables table artifact writes, and `BACKBONE_DIFFUSION_SAVE_TABLES=1` re-enables table writes even when Drive mounting is skipped.
+
+V3b saves:
+
+- `backbone_diffusion_history` with total, noise, bond-geometry, adjacent-CA-geometry, and x0 RMSE columns for train/validation/test
+- `v3b_run_config_summary`
+- `v3b_timestep_diagnostics`
+- `v3b_real_eval_metrics`
+- `v3b_generated_eval_metrics`
+- `v3b_real_vs_generated_metric_summary`
+- `v3b_structural_gap_summary`
+- `v3b_collapse_summary`
+- `v3b_vs_v2_metric_comparison` and `v3b_vs_v2_collapse_comparison` when V2 reference artifacts are available
+- `v3b_vs_v3_metric_comparison` and `v3b_vs_v3_collapse_comparison` when V3 reference artifacts are available
+
+Radius-of-gyration loss was deliberately not added. It remains an evaluation metric only, because direct radius regularization may force proteins toward one global size and obscure whether local geometry supervision alone helps.
+
+Local validation performed here:
+
+- `python3 -m json.tool notebooks/protein_backbone_diffusion_v3b.ipynb` passed
+- all V3b notebook code cells compile with Python `compile(...)`
+
+The full training run has not yet been executed in this local workspace. The next step is to run V3b in Colab, extract `results/v3b/`, and compare adjacent-CA in-band fraction, adjacent-CA mean, bond means, radius of gyration, collapse fraction, and poor CA-band fraction against V2 and V3.
