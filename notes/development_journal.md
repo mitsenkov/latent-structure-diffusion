@@ -1461,7 +1461,7 @@ The V4 denoiser is intentionally small and sparse:
   - intra-residue `C-O`
   - adjacent-residue `C-N`
   - adjacent `CA-CA`
-  - optional nonlocal `CA-CA` sequence-offset edges with defaults `±8`, `±16`, and `±32`
+  - optional nonlocal `CA-CA` sequence-offset edges with defaults `+/-8`, `+/-16`, and `+/-32`
 - EGNN-style blocks update hidden states from node features plus squared distances, and update coordinates through learned scalar weights on relative vectors
 - predicted noise is read out as the masked coordinate delta between refined node coordinates and the input noisy coordinates
 
@@ -1519,3 +1519,82 @@ The missing runtime smoke checks in this workspace are:
 - run one tiny sampling pass
 
 Those should be done in the notebook runtime before trusting V4 training results.
+
+## V4 troubleshooting update: make the EGNN a real DDPM predictor
+
+After the first V4 smoke runs, the most likely failure mode was no longer "EGNNs are a bad idea." It was much narrower:
+
+- the original V4 hidden state did not ingest raw noisy coordinates directly
+- hidden-state updates depended mainly on static node metadata plus squared distances
+- the final DDPM prediction was only `coords_refined - coords_input`
+- that coordinate path had also been intentionally stabilized with bounded small updates and a zero-initialized final coordinate head
+
+So V4 began training very close to an all-zero noise predictor and had no strong direct regression path analogous to the V3b flattened denoiser's explicit output head. That is a plausible explanation for the flat losses around `0.82` to `0.83`, high geometry losses, and visually dead samples.
+
+### Concrete V4 fixes now applied
+
+The shared module `src/latent_structure_generation/backbone_diffusion.py` and `notebooks/protein_backbone_diffusion_v4.ipynb` were updated with a minimal, high-value patch set:
+
+- keep EGNN-style coordinate-aware message passing
+- inject raw noisy node coordinates and coordinate norms into the initial node-state features
+- keep the coordinate-refinement path, but stop using it as the only output
+- add an explicit per-node noise head that predicts `(x, y, z)` noise from:
+  - final hidden state
+  - input noisy coordinates
+  - learned coordinate residual
+- combine:
+  - hidden-state noise prediction
+  - coordinate residual path
+- relax the exact-zero coordinate-head init to a tiny random init so the coordinate branch is still stable but not perfectly dead
+- reduce default nonlocal CA sequence-offset edges from `+/-8, +/-16, +/-32` to `+/-8, +/-16`
+- reduce default V4 learning rate from `1e-3` to `5e-4`
+- add debugging metrics to the training history and fixed-timestep diagnostics:
+  - predicted noise RMS
+  - `x_t` RMS
+  - `x0_pred` RMS
+  - near-zero prediction fraction
+  - coordinate residual RMS
+  - node-head RMS
+  - per-layer coordinate-update RMS summary
+
+### Why this is the right next test
+
+This preserves what matters for comparability:
+
+- same data splits
+- same chunking
+- same normalization
+- same DDPM schedule
+- same V3b objective
+- no V3c radius loss
+- same sampling and evaluation structure
+
+But it removes the most obvious architectural handicap:
+
+- V3b had an explicit supervised path from model internals to predicted noise
+- the old V4 effectively forced all supervision through tiny coordinate displacements
+- the patched V4 now has a direct noise head while still letting the EGNN coordinate branch contribute structural reasoning
+
+So the next short run should answer a cleaner question:
+
+- does the architecture learn once the prediction path is no longer bottlenecked?
+
+### Practical next run
+
+The notebook is now set up so the next V4 rerun should be done from training onward with the updated architecture and defaults:
+
+- `BACKBONE_DIFFUSION_MODEL_HIDDEN_DIM=192` by default
+- `BACKBONE_DIFFUSION_MODEL_NUM_LAYERS=4` by default
+- `BACKBONE_DIFFUSION_SEQUENCE_OFFSET_EDGES=8,16` by default
+- `BACKBONE_DIFFUSION_LEARNING_RATE=5e-4` by default
+- `BACKBONE_DIFFUSION_GRAD_CLIP_NORM=0.5` by default
+
+The first thing to inspect after rerunning is not just validation total loss. It is whether:
+
+- train total starts decreasing in the first few epochs
+- validation noise stops staying flat
+- predicted noise RMS is non-trivial
+- near-zero fraction is not stuck near `1.0`
+- bond and adjacent-CA losses begin moving down
+
+If those move in the right direction, V4 becomes a meaningful architecture experiment instead of a failed smoke run.

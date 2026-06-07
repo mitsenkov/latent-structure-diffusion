@@ -519,6 +519,7 @@ class BackboneEGNNBlock(nn.Module):
     def __init__(self, hidden_dim: int, edge_feature_dim: int, coord_update_scale: float = 0.1):
         super().__init__()
         self.coord_update_scale = float(coord_update_scale)
+        coord_hidden_dim = max(hidden_dim // 2, 16)
         self.message_mlp = nn.Sequential(
             nn.LayerNorm((hidden_dim * 2) + edge_feature_dim + 1),
             nn.Linear((hidden_dim * 2) + edge_feature_dim + 1, hidden_dim),
@@ -527,9 +528,9 @@ class BackboneEGNNBlock(nn.Module):
             nn.SiLU(),
         )
         self.coord_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim, coord_hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(coord_hidden_dim, 1),
         )
         self.node_mlp = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
@@ -543,7 +544,7 @@ class BackboneEGNNBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
-        nn.init.zeros_(self.coord_mlp[-1].weight)
+        nn.init.normal_(self.coord_mlp[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.coord_mlp[-1].bias)
 
     def forward(
@@ -554,7 +555,7 @@ class BackboneEGNNBlock(nn.Module):
         edge_src: torch.Tensor,
         edge_dst: torch.Tensor,
         edge_attr: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         src_h = h[:, edge_src]
         dst_h = h[:, edge_dst]
         rel = coords[:, edge_src] - coords[:, edge_dst]
@@ -573,6 +574,10 @@ class BackboneEGNNBlock(nn.Module):
         degree = degree.clamp_min(1.0)
 
         coords = (coords + (aggregated_coord / degree)) * node_mask.unsqueeze(-1)
+        coord_update_rms = torch.sqrt(
+            ((aggregated_coord / degree).pow(2) * node_mask.unsqueeze(-1)).sum()
+            / (node_mask.sum().clamp_min(1.0) * coords.shape[-1])
+        )
 
         aggregated_messages = torch.zeros_like(h)
         aggregated_messages.index_add_(1, edge_src, messages)
@@ -581,7 +586,7 @@ class BackboneEGNNBlock(nn.Module):
         h = h + self.node_mlp(torch.cat([h, aggregated_messages], dim=-1))
         h = h + self.ffn(h)
         h = h * node_mask.unsqueeze(-1)
-        return h, coords
+        return h, coords, coord_update_rms
 
 
 class BackboneCoordinateEGNNDenoiser(nn.Module):
@@ -606,6 +611,16 @@ class BackboneCoordinateEGNNDenoiser(nn.Module):
 
         self.atom_emb = nn.Embedding(self.atom_count, hidden_dim)
         self.residue_emb = nn.Embedding(max_length, hidden_dim)
+        self.coord_input_mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.coord_norm_mlp = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self.residue_pos_mlp = nn.Sequential(
             nn.Linear(1, hidden_dim),
             nn.SiLU(),
@@ -621,6 +636,15 @@ class BackboneCoordinateEGNNDenoiser(nn.Module):
         self.blocks = nn.ModuleList(
             [BackboneEGNNBlock(hidden_dim=hidden_dim, edge_feature_dim=self.edge_feature_dim) for _ in range(num_layers)]
         )
+        self.node_output_mlp = nn.Sequential(
+            nn.LayerNorm(hidden_dim + 6),
+            nn.Linear(hidden_dim + 6, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 3),
+        )
+        nn.init.normal_(self.node_output_mlp[-1].weight, mean=0.0, std=1e-2)
+        nn.init.zeros_(self.node_output_mlp[-1].bias)
+        self.last_forward_stats: dict[str, float] = {}
 
         edge_src, edge_dst, edge_type = self._build_backbone_edges(max_length)
         self.register_buffer("edge_src", edge_src, persistent=False)
@@ -708,11 +732,14 @@ class BackboneCoordinateEGNNDenoiser(nn.Module):
             .reshape(batch_size, node_count)
         )
         residue_pos = residue_ids.float().unsqueeze(-1) / max(self.max_length - 1, 1)
+        coord_norm = torch.linalg.norm(coords, dim=-1, keepdim=True)
         time_emb = self.time_mlp(sinusoidal_timestep_embedding(t, self.time_embedding_dim)).unsqueeze(1)
 
         h = (
             self.atom_emb(atom_ids)
             + self.residue_emb(residue_ids)
+            + self.coord_input_mlp(coords)
+            + self.coord_norm_mlp(coord_norm)
             + self.residue_pos_mlp(residue_pos)
             + self.mask_proj(node_mask.unsqueeze(-1))
             + time_emb
@@ -725,10 +752,31 @@ class BackboneCoordinateEGNNDenoiser(nn.Module):
         edge_type = self.edge_type[edge_keep].to(x_t.device)
         edge_attr = self.edge_emb(edge_type).unsqueeze(0).expand(batch_size, -1, -1)
 
+        coord_update_rms_values: list[torch.Tensor] = []
         for block in self.blocks:
-            h, coords = block(h, coords, node_mask, edge_src, edge_dst, edge_attr)
+            h, coords, coord_update_rms = block(h, coords, node_mask, edge_src, edge_dst, edge_attr)
+            coord_update_rms_values.append(coord_update_rms)
 
-        pred = (coords - input_coords) * node_mask.unsqueeze(-1)
+        coord_residual = (coords - input_coords) * node_mask.unsqueeze(-1)
+        node_output_features = torch.cat([h, input_coords, coord_residual], dim=-1)
+        node_noise = self.node_output_mlp(node_output_features) * node_mask.unsqueeze(-1)
+        pred = node_noise + coord_residual
+        valid_coords = node_mask.sum().clamp_min(1.0) * pred.shape[-1]
+        near_zero_fraction = (
+            (pred.abs() < 1e-3).float() * node_mask.unsqueeze(-1)
+        ).sum() / valid_coords
+        coord_update_rms_mean = torch.stack(coord_update_rms_values).mean() if coord_update_rms_values else pred.new_tensor(0.0)
+        self.last_forward_stats = {
+            "pred_noise_rms": float(torch.sqrt((pred.pow(2) * node_mask.unsqueeze(-1)).sum() / valid_coords).detach().cpu()),
+            "coord_residual_rms": float(
+                torch.sqrt((coord_residual.pow(2) * node_mask.unsqueeze(-1)).sum() / valid_coords).detach().cpu()
+            ),
+            "node_head_rms": float(
+                torch.sqrt((node_noise.pow(2) * node_mask.unsqueeze(-1)).sum() / valid_coords).detach().cpu()
+            ),
+            "coord_update_rms": float(coord_update_rms_mean.detach().cpu()),
+            "near_zero_fraction": float(near_zero_fraction.detach().cpu()),
+        }
         return pred.reshape(batch_size, seq_len, self.atom_count, 3).reshape(batch_size, seq_len, 12)
 
 
