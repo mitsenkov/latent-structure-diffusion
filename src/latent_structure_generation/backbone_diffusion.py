@@ -513,6 +513,225 @@ class BackboneDenoiser(nn.Module):
         return out
 
 
+class BackboneEGNNBlock(nn.Module):
+    """Sparse EGNN-style block for backbone atom graphs."""
+
+    def __init__(self, hidden_dim: int, edge_feature_dim: int, coord_update_scale: float = 0.1):
+        super().__init__()
+        self.coord_update_scale = float(coord_update_scale)
+        self.message_mlp = nn.Sequential(
+            nn.LayerNorm((hidden_dim * 2) + edge_feature_dim + 1),
+            nn.Linear((hidden_dim * 2) + edge_feature_dim + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.coord_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+        self.node_mlp = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        nn.init.zeros_(self.coord_mlp[-1].weight)
+        nn.init.zeros_(self.coord_mlp[-1].bias)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        coords: torch.Tensor,
+        node_mask: torch.Tensor,
+        edge_src: torch.Tensor,
+        edge_dst: torch.Tensor,
+        edge_attr: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        src_h = h[:, edge_src]
+        dst_h = h[:, edge_dst]
+        rel = coords[:, edge_src] - coords[:, edge_dst]
+        dist2 = rel.pow(2).sum(dim=-1, keepdim=True)
+        edge_mask = (node_mask[:, edge_src] * node_mask[:, edge_dst]).unsqueeze(-1)
+
+        messages = self.message_mlp(torch.cat([src_h, dst_h, edge_attr, dist2], dim=-1)) * edge_mask
+
+        coord_weights = torch.tanh(self.coord_mlp(messages)) * self.coord_update_scale
+        coord_updates = rel * coord_weights * edge_mask
+        aggregated_coord = torch.zeros_like(coords)
+        aggregated_coord.index_add_(1, edge_src, coord_updates)
+
+        degree = torch.zeros(h.shape[0], h.shape[1], 1, device=h.device, dtype=h.dtype)
+        degree.index_add_(1, edge_src, edge_mask)
+        degree = degree.clamp_min(1.0)
+
+        coords = (coords + (aggregated_coord / degree)) * node_mask.unsqueeze(-1)
+
+        aggregated_messages = torch.zeros_like(h)
+        aggregated_messages.index_add_(1, edge_src, messages)
+        aggregated_messages = aggregated_messages / degree
+
+        h = h + self.node_mlp(torch.cat([h, aggregated_messages], dim=-1))
+        h = h + self.ffn(h)
+        h = h * node_mask.unsqueeze(-1)
+        return h, coords
+
+
+class BackboneCoordinateEGNNDenoiser(nn.Module):
+    """Coordinate-aware EGNN-style denoiser for flattened backbone DDPM inputs."""
+
+    def __init__(
+        self,
+        max_length: int = 256,
+        hidden_dim: int = 192,
+        num_layers: int = 4,
+        time_embedding_dim: int = 128,
+        sequence_offset_edges: tuple[int, ...] = (8, 16, 32),
+    ):
+        super().__init__()
+        self.max_length = max_length
+        self.hidden_dim = hidden_dim
+        self.time_embedding_dim = time_embedding_dim
+        self.atom_count = len(BACKBONE_ATOMS)
+        self.sequence_offset_edges = tuple(sorted({int(offset) for offset in sequence_offset_edges if int(offset) > 0}))
+        self.edge_type_count = 5 + len(self.sequence_offset_edges)
+        self.edge_feature_dim = max(hidden_dim // 4, 16)
+
+        self.atom_emb = nn.Embedding(self.atom_count, hidden_dim)
+        self.residue_emb = nn.Embedding(max_length, hidden_dim)
+        self.residue_pos_mlp = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.mask_proj = nn.Linear(1, hidden_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_embedding_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.edge_emb = nn.Embedding(self.edge_type_count, self.edge_feature_dim)
+        self.blocks = nn.ModuleList(
+            [BackboneEGNNBlock(hidden_dim=hidden_dim, edge_feature_dim=self.edge_feature_dim) for _ in range(num_layers)]
+        )
+
+        edge_src, edge_dst, edge_type = self._build_backbone_edges(max_length)
+        self.register_buffer("edge_src", edge_src, persistent=False)
+        self.register_buffer("edge_dst", edge_dst, persistent=False)
+        self.register_buffer("edge_type", edge_type, persistent=False)
+
+    def _atom_node(self, residue_index: int, atom_index: int) -> int:
+        return (residue_index * self.atom_count) + atom_index
+
+    def _add_bidirectional_edge(
+        self,
+        sources: list[int],
+        destinations: list[int],
+        edge_types: list[int],
+        left: int,
+        right: int,
+        edge_type: int,
+    ) -> None:
+        sources.extend([left, right])
+        destinations.extend([right, left])
+        edge_types.extend([edge_type, edge_type])
+
+    def _build_backbone_edges(self, max_length: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sources: list[int] = []
+        destinations: list[int] = []
+        edge_types: list[int] = []
+
+        for residue_index in range(max_length):
+            n = self._atom_node(residue_index, 0)
+            ca = self._atom_node(residue_index, 1)
+            c = self._atom_node(residue_index, 2)
+            o = self._atom_node(residue_index, 3)
+            self._add_bidirectional_edge(sources, destinations, edge_types, n, ca, 0)
+            self._add_bidirectional_edge(sources, destinations, edge_types, ca, c, 1)
+            self._add_bidirectional_edge(sources, destinations, edge_types, c, o, 2)
+
+            if residue_index + 1 < max_length:
+                next_n = self._atom_node(residue_index + 1, 0)
+                next_ca = self._atom_node(residue_index + 1, 1)
+                self._add_bidirectional_edge(sources, destinations, edge_types, c, next_n, 3)
+                self._add_bidirectional_edge(sources, destinations, edge_types, ca, next_ca, 4)
+
+            for offset_index, offset in enumerate(self.sequence_offset_edges):
+                target_residue = residue_index + offset
+                if target_residue >= max_length:
+                    continue
+                target_ca = self._atom_node(target_residue, 1)
+                self._add_bidirectional_edge(sources, destinations, edge_types, ca, target_ca, 5 + offset_index)
+
+        return (
+            torch.tensor(sources, dtype=torch.long),
+            torch.tensor(destinations, dtype=torch.long),
+            torch.tensor(edge_types, dtype=torch.long),
+        )
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if x_t.ndim != 3 or x_t.shape[-1] != 12:
+            raise ValueError("x_t must have shape (B, L, 12).")
+        if mask.ndim != 2:
+            raise ValueError("mask must have shape (B, L).")
+        if x_t.shape[:2] != mask.shape:
+            raise ValueError("x_t and mask must agree on batch and length dimensions.")
+        if x_t.shape[1] > self.max_length:
+            raise ValueError(
+                f"Sequence length {x_t.shape[1]} exceeds max_length={self.max_length}. "
+                "Increase the model max_length or crop the dataset."
+            )
+
+        batch_size, seq_len, _ = x_t.shape
+        node_count = seq_len * self.atom_count
+        coords = x_t.reshape(batch_size, seq_len, self.atom_count, 3).reshape(batch_size, node_count, 3)
+        input_coords = coords
+        node_mask = mask.unsqueeze(-1).expand(-1, -1, self.atom_count).reshape(batch_size, node_count).float()
+
+        atom_ids = (
+            torch.arange(self.atom_count, device=x_t.device)
+            .view(1, 1, self.atom_count)
+            .expand(batch_size, seq_len, self.atom_count)
+            .reshape(batch_size, node_count)
+        )
+        residue_ids = (
+            torch.arange(seq_len, device=x_t.device)
+            .view(1, seq_len, 1)
+            .expand(batch_size, seq_len, self.atom_count)
+            .reshape(batch_size, node_count)
+        )
+        residue_pos = residue_ids.float().unsqueeze(-1) / max(self.max_length - 1, 1)
+        time_emb = self.time_mlp(sinusoidal_timestep_embedding(t, self.time_embedding_dim)).unsqueeze(1)
+
+        h = (
+            self.atom_emb(atom_ids)
+            + self.residue_emb(residue_ids)
+            + self.residue_pos_mlp(residue_pos)
+            + self.mask_proj(node_mask.unsqueeze(-1))
+            + time_emb
+        )
+        h = h * node_mask.unsqueeze(-1)
+
+        edge_keep = (self.edge_src < node_count) & (self.edge_dst < node_count)
+        edge_src = self.edge_src[edge_keep].to(x_t.device)
+        edge_dst = self.edge_dst[edge_keep].to(x_t.device)
+        edge_type = self.edge_type[edge_keep].to(x_t.device)
+        edge_attr = self.edge_emb(edge_type).unsqueeze(0).expand(batch_size, -1, -1)
+
+        for block in self.blocks:
+            h, coords = block(h, coords, node_mask, edge_src, edge_dst, edge_attr)
+
+        pred = (coords - input_coords) * node_mask.unsqueeze(-1)
+        return pred.reshape(batch_size, seq_len, self.atom_count, 3).reshape(batch_size, seq_len, 12)
+
+
 def masked_noise_mse(pred_noise: torch.Tensor, true_noise: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Masked mean squared error over valid residues only."""
 

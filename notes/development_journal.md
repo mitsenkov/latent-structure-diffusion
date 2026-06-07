@@ -1134,3 +1134,388 @@ The point of V3c is narrow:
 - preserve the V3b local-geometry gains as much as possible
 
 The anti-collapse term should remain soft. It should do nothing once a structure is above a conservative radius threshold, and it should stay small enough that validation noise loss and adjacent CA in-band fraction are not destroyed.
+
+## 2026-06-07 V3c 100-epoch result review
+
+V3c was run for 100 epochs with the stable V3b local-geometry objective plus a weak anti-collapse term.
+
+Configuration:
+
+```text
+epochs: 100
+timesteps: 100
+lambda_bond: 0.01
+lambda_ca: 0.01
+lambda_collapse: 0.0015
+geometry_max_timestep: 50
+collapse_radius_min: 8.755 A
+best epoch: 94
+best validation total loss: 0.07349
+best validation noise loss: 0.07206
+test noise loss at reported best epoch: 0.07625
+```
+
+### Generated structural metrics
+
+| Metric | Real | V2 | V3 | V3b 100 ep | V3c 100 ep |
+|---|---:|---:|---:|---:|---:|
+| Adjacent CA mean | 3.810 | 3.099 | 3.531 | 3.162 | 3.382 |
+| Adjacent CA in-band fraction | 0.999 | 0.265 | 0.258 | 0.728 | 0.781 |
+| Radius of gyration | 16.213 | 7.148 | 8.045 | 7.855 | 7.650 |
+| N-CA mean | 1.464 | 1.212 | 1.360 | 1.151 | 1.257 |
+| CA-C mean | 1.525 | 1.254 | 1.361 | 1.190 | 1.319 |
+| C-O mean | 1.229 | 1.027 | 1.209 | 0.964 | 1.053 |
+| C-N mean | 1.330 | 1.196 | 1.233 | 1.269 | 1.289 |
+
+Collapse summary:
+
+| Version | Sample count | Collapse count | Collapse fraction | Poor CA-band count | Poor CA-band fraction |
+|---|---:|---:|---:|---:|---:|
+| V2 | 32 | 31 | 0.969 | 32 | 1.000 |
+| V3 | 32 | 20 | 0.625 | 32 | 1.000 |
+| V3b 100 ep | 32 | 19 | 0.594 | 18 | 0.562 |
+| V3c 100 ep | 32 | 26 | 0.812 | 17 | 0.531 |
+
+### Interpretation
+
+V3c is a mixed result.
+
+The good news is that local backbone validity improved again. Compared with the 100-epoch V3b result, V3c moved adjacent CA distances closer to the 3.8 A target, raised adjacent CA in-band fraction from `0.728` to `0.781`, and moved all tracked bond means closer to real values. The per-sample distribution is also encouraging: median CA-band fraction is about `0.788`, and the best generated samples reach `0.988`, which means some samples are now locally close to valid backbone traces.
+
+The bad news is that the anti-collapse term did not reduce global collapse. Radius of gyration decreased from `7.855` in V3b to `7.650` in V3c, still far below the real mean of `16.213`. Collapse count worsened from `19/32` to `26/32`. This means the current weak radius lower-bound loss is not enough to make samples globally expanded, even though optimization itself looks healthy.
+
+The most important conclusion is:
+
+```text
+V3c improves local geometry but does not solve global collapse.
+```
+
+This suggests the anti-collapse term is either too weak, applied too indirectly, or mismatched to the sampling failure mode. It should not be presented as a clean improvement over V3b yet. The strongest current result remains the stable 100-epoch V3b/V3c family as evidence that geometry supervision helps, with V3b better on collapse and V3c better on local distance quality.
+
+### Recommended next experiment
+
+Do not jump straight to a large architecture change based only on this run. The immediate next experiment should isolate global guidance more carefully:
+
+```text
+Keep the stable V3c setup, but test a stronger or better-targeted anti-collapse mechanism while monitoring whether CA-band quality is preserved.
+```
+
+Practical options:
+
+- raise `lambda_collapse` cautiously, for example from `0.0015` to `0.003` or `0.005`
+- apply the collapse penalty over a wider timestep range rather than only low-noise geometry timesteps
+- try a nonlocal CA-distance spread term instead of, or alongside, radius-of-gyration hinge loss
+- keep best-checkpoint sampling enabled so the generated metrics are tied to the best validation model
+
+The risk remains that a radius penalty can expand structures unnaturally. Therefore, success should be judged by multiple metrics together, not radius alone: CA-band fraction, bond means, collapse count, poor CA-band count, and visual continuity all need to move in the right direction.
+
+## 2026-06-07 V3c aggressive anti-collapse review
+
+The next V3c run increased the anti-collapse setting:
+
+```text
+lambda_bond: 0.01
+lambda_ca: 0.01
+lambda_collapse: 0.01
+geometry_max_timestep: 75
+epochs: 100
+best epoch: 82
+best validation total loss: 0.07084
+best validation noise loss: 0.06940
+test noise loss at reported best epoch: 0.07251
+```
+
+The extracted outputs are stored separately under:
+
+```text
+results/v3c_aggressive_lambda001/
+```
+
+### Important comparability caveat
+
+This run may not be a clean from-scratch comparison. Epoch 1 already starts at a low train total loss of about `0.081`, whereas the previous clean V3c run started around `0.232`. That strongly suggests the notebook may have continued from an already-trained in-memory model or checkpointed state rather than starting from a fresh initialization.
+
+Therefore this result is still useful as an intervention test, but it should not be treated as a clean apples-to-apples V3c rerun unless the runtime was restarted and the notebook was executed from the top.
+
+### Generated structural metrics
+
+| Metric | Real | V3b 100 ep | V3c weak collapse | V3c aggressive collapse |
+|---|---:|---:|---:|---:|
+| Adjacent CA mean | 3.810 | 3.162 | 3.382 | 2.845 |
+| Adjacent CA in-band fraction | 0.999 | 0.728 | 0.781 | 0.595 |
+| Radius of gyration | 16.213 | 7.855 | 7.650 | 7.525 |
+| N-CA mean | 1.464 | 1.151 | 1.257 | 1.008 |
+| CA-C mean | 1.525 | 1.190 | 1.319 | 1.041 |
+| C-O mean | 1.229 | 0.964 | 1.053 | 0.837 |
+| C-N mean | 1.330 | 1.269 | 1.289 | 1.223 |
+
+Collapse summary:
+
+| Version | Collapse count | Collapse fraction | Poor CA-band count | Poor CA-band fraction |
+|---|---:|---:|---:|---:|
+| V3b 100 ep | 19/32 | 0.594 | 18/32 | 0.562 |
+| V3c weak collapse | 26/32 | 0.812 | 17/32 | 0.531 |
+| V3c aggressive collapse | 24/32 | 0.750 | 24/32 | 0.750 |
+
+### Interpretation
+
+The aggressive anti-collapse run had a real effect, but not the desired measured effect.
+
+Training loss looked numerically strong, with lower best validation noise loss than the previous weak-collapse V3c run. However, the generated structures became worse by the structural metrics that matter most. Adjacent CA mean moved away from the target, CA-band fraction dropped from `0.781` to `0.595`, and all tracked bond lengths became too short. Radius of gyration also decreased slightly rather than increasing.
+
+The visual impression of more relaxed or opened-up chains may reflect local rearrangement or less visually tangled samples, but the metric summary says the model did not actually produce globally expanded protein-like backbones. The generated radius remains about `7.5 A`, far below the real value around `16.2 A`.
+
+This result suggests that simply increasing `lambda_collapse` is not enough, and may interfere with local geometry when combined with a wider geometry timestep window.
+
+### Working conclusion
+
+```text
+The aggressive V3c setting is not a clear improvement. It may alter the visual character of samples, but it worsens adjacent CA validity, bond lengths, poor CA-band count, and radius of gyration.
+```
+
+The best current evidence remains:
+
+```text
+Stable local geometry supervision is useful.
+The current radius-hinge anti-collapse term is not solving global collapse.
+```
+
+### Recommended response
+
+For a clean next check, restart the runtime and run from the top with one controlled change at a time:
+
+```text
+Option A:
+lambda_collapse = 0.005
+geometry_max_timestep = 50
+
+Option B:
+lambda_collapse = 0.005
+geometry_max_timestep = 75
+```
+
+Avoid combining a large collapse weight and a wider timestep range until a clean intermediate setting shows real improvement in both radius and CA-band quality.
+
+The next more principled anti-collapse experiment should probably move away from only radius-of-gyration hinge loss. A weak nonlocal CA-distance spread objective may better discourage collapsed folds without forcing every chain toward one global radius.
+
+## 2026-06-07 V3c moderate anti-collapse review
+
+A cleaner intermediate V3c run was completed with:
+
+```text
+lambda_bond: 0.01
+lambda_ca: 0.01
+lambda_collapse: 0.005
+geometry_max_timestep: 50
+epochs: 100
+timesteps: 100
+learning_rate: 0.001
+best epoch: 89
+best validation total loss: 0.07304
+best validation noise loss: 0.07172
+test noise loss at reported best epoch: 0.07277
+```
+
+The extracted outputs are stored separately under:
+
+```text
+results/v3c_mid_lambda0005_t50/
+```
+
+Unlike the aggressive `lambda_collapse=0.01, geometry_max_timestep=75` run, this appears to be a clean from-scratch run. Epoch 1 starts with high loss:
+
+```text
+epoch 1 train total loss: 0.2328
+epoch 1 validation total loss: 0.1434
+```
+
+That pattern matches the earlier clean runs and does not look like continuation from an already-trained in-memory model.
+
+### Training behavior
+
+The optimization itself looks normal. Loss falls rapidly during the first few epochs and then improves more slowly:
+
+```text
+best validation total loss: 0.07304 at epoch 89
+best validation noise loss: 0.07172 at epoch 89
+```
+
+The validation geometry losses fluctuate in later epochs, but not in a catastrophic way. This does not look like learning-rate instability. The more important issue is that the anti-collapse loss is still usually tiny or zero on validation batches, so the radius-hinge term is not reliably steering the generated samples away from collapse.
+
+### Generated structural metrics
+
+| Metric | Real | V3b 100 ep | V3c weak collapse | V3c moderate collapse | V3c aggressive collapse |
+|---|---:|---:|---:|---:|---:|
+| Adjacent CA mean | 3.810 | 3.162 | 3.382 | 3.205 | 2.845 |
+| Adjacent CA in-band fraction | 0.999 | 0.728 | 0.781 | 0.704 | 0.595 |
+| Radius of gyration | 16.213 | 7.855 | 7.650 | 7.416 | 7.525 |
+| N-CA mean | 1.464 | 1.151 | 1.257 | 1.189 | 1.008 |
+| CA-C mean | 1.525 | 1.190 | 1.319 | 1.243 | 1.041 |
+| C-O mean | 1.229 | 0.964 | 1.053 | 0.991 | 0.837 |
+| C-N mean | 1.330 | 1.269 | 1.289 | 1.217 | 1.223 |
+
+Collapse summary:
+
+| Version | Collapse count | Collapse fraction | Poor CA-band count | Poor CA-band fraction |
+|---|---:|---:|---:|---:|
+| V3b 100 ep | 19/32 | 0.594 | 18/32 | 0.562 |
+| V3c weak collapse, 0.0015/t50 | 26/32 | 0.812 | 17/32 | 0.531 |
+| V3c moderate collapse, 0.005/t50 | 26/32 | 0.812 | 19/32 | 0.594 |
+| V3c aggressive collapse, 0.01/t75 | 24/32 | 0.750 | 24/32 | 0.750 |
+
+### Interpretation
+
+This run is a partial improvement only if compared against the original V2/V3 failures. It is much better than V2 and V3 on adjacent CA in-band fraction:
+
+```text
+V2 CA in-band: 0.265
+V3 CA in-band: 0.258
+V3c moderate CA in-band: 0.704
+```
+
+However, against the stronger 100-epoch V3b and weak-collapse V3c baselines, the moderate-collapse run is not a clear improvement.
+
+Compared with V3b 100 epoch:
+
+```text
+adjacent CA mean improves slightly: 3.162 -> 3.205
+bond means improve for N-CA, CA-C, and C-O
+CA in-band worsens: 0.728 -> 0.704
+radius worsens: 7.855 -> 7.416
+collapse worsens: 19/32 -> 26/32
+poor CA-band worsens: 18/32 -> 19/32
+```
+
+Compared with weak-collapse V3c:
+
+```text
+adjacent CA mean worsens: 3.382 -> 3.205
+CA in-band worsens: 0.781 -> 0.704
+radius worsens: 7.650 -> 7.416
+collapse stays bad: 26/32 -> 26/32
+poor CA-band worsens: 17/32 -> 19/32
+```
+
+The visual samples may still appear more relaxed or less tangled because the loss changes the character of generated chains. But the measured radius of gyration did not increase, and collapse count did not drop. Therefore the numeric evidence does not support calling this a successful anti-collapse improvement.
+
+### Working conclusion
+
+```text
+The moderate V3c anti-collapse setting is a clean and useful negative result.
+It confirms that simply increasing the radius-hinge loss from 0.0015 to 0.005 does not fix global collapse.
+```
+
+This does not invalidate the geometry-loss direction. The V3b/V3c family still shows that local geometry supervision can greatly improve adjacent CA validity relative to V2/V3. But it does suggest that the current radius-of-gyration hinge is not the right main mechanism for global structure.
+
+### Recommendation
+
+Stop spending major time tuning this exact V3c radius-hinge mechanism. The next step should be V4 EGNN, using the V3b/V3c lessons:
+
+```text
+keep best-checkpoint sampling
+keep geometry losses on x0_pred
+keep the structural metric suite
+replace the flattened denoiser with a coordinate-aware/equivariant graph denoiser
+```
+
+The V3c story is now useful for the report: local losses help, simple global radius regularization does not reliably solve collapse, and this motivates moving to an architecture with a stronger geometric inductive bias.
+
+## V4 implementation update: EGNN-style coordinate-aware denoiser
+
+V4 has now been scaffolded as:
+
+```text
+notebooks/protein_backbone_diffusion_v4.ipynb
+```
+
+with artifacts directed to:
+
+```text
+results/v4/
+```
+
+### What changed
+
+V4 starts from the clean V3b notebook structure, not V3c. The retained pieces are the same ones that made V3b a stable comparison point:
+
+- the chunked train / chain-level validation / test data pipeline
+- train-only coordinate normalization
+- `B x L x 4 x 3` backbone representation with residue masking
+- 100-step linear DDPM schedule
+- geometry-augmented loss on `x0_pred`
+- history tables, fixed-timestep diagnostics, generated-structure metrics, collapse summaries, and comparison tables
+
+The main model change is architectural. The flattened denoiser has been replaced by `BackboneCoordinateEGNNDenoiser` in `src/latent_structure_generation/backbone_diffusion.py`.
+
+### Current V4 model design
+
+The V4 denoiser is intentionally small and sparse:
+
+- nodes are backbone atoms `N, CA, C, O`
+- internal coordinates stay as `B x L x 4 x 3`
+- the public DDPM interface still uses flattened `(B, L, 12)` tensors so the V3b training and sampling code stays compatible
+- node features use atom identity, learned residue position embeddings, normalized residue index, timestep embedding, and node-mask conditioning
+- sparse edges include:
+  - intra-residue `N-CA`
+  - intra-residue `CA-C`
+  - intra-residue `C-O`
+  - adjacent-residue `C-N`
+  - adjacent `CA-CA`
+  - optional nonlocal `CA-CA` sequence-offset edges with defaults `±8`, `±16`, and `±32`
+- EGNN-style blocks update hidden states from node features plus squared distances, and update coordinates through learned scalar weights on relative vectors
+- predicted noise is read out as the masked coordinate delta between refined node coordinates and the input noisy coordinates
+
+This keeps the model coordinate-aware and equivariant in the coordinate-update path without introducing dense all-pairs edges.
+
+### Loss and training choices carried forward from V3b
+
+The V4 notebook preserves the stable V3b objective exactly:
+
+```text
+noise_mse
++ 0.01 * bond_geometry_loss(x0_pred)
++ 0.01 * adjacent_ca_geometry_loss(x0_pred)
+```
+
+with:
+
+```text
+geometry_loss_type = Smooth L1
+geometry_loss_beta = 0.5
+geometry_max_timestep = 50
+no radius-of-gyration anti-collapse loss
+```
+
+The notebook now also reloads the saved best-validation checkpoint before final sampling and evaluation, so the reported V4 sample metrics will match the checkpoint-selection rule.
+
+### Intended comparison framing
+
+The V4 report should be framed narrowly and defensibly:
+
+- V2: the flattened DDPM trains but collapses
+- V3: local atom-graph message passing alone was not enough
+- V3b: explicit local geometry losses improve local backbone realism substantially
+- V3c: simple radius-hinge anti-collapse loss does not reliably solve global collapse
+- V4: test whether a coordinate-aware sparse EGNN-style denoiser can preserve the V3b local-geometry gains while improving radius of gyration and collapse counts
+
+### Validation status in this workspace
+
+Local execution here is still limited by the environment:
+
+- `torch` is not installed in the available Python interpreter
+- `nbformat` is not installed either
+
+So the completed local checks were:
+
+- notebook JSON rewrite completed cleanly
+- code-cell compilation check is possible without execution
+- `python -m json.tool` validation should be run on the final notebook
+
+The missing runtime smoke checks in this workspace are:
+
+- instantiate the V4 model with `torch`
+- run one forward pass on a small batch
+- compute one loss
+- run one tiny sampling pass
+
+Those should be done in the notebook runtime before trusting V4 training results.
