@@ -568,7 +568,7 @@ The notebook preserves the V2 DDPM setup:
 The main implementation change is in training. After the model predicts noise, V3b reconstructs:
 
 ```python
-x0_pred = predict_x0(x_t, t, pred_noise, schedule['alpha_bars'])
+x0_pred = differentiable_predict_x0(x_t, t, pred_noise, schedule['alpha_bars'])
 ```
 
 It then converts `x0_pred` from normalized flattened coordinates back to `B x L x 4 x 3` Angstrom coordinates before measuring geometry. The total objective is:
@@ -618,4 +618,236 @@ Local validation performed here:
 - `python3 -m json.tool notebooks/protein_backbone_diffusion_v3b.ipynb` passed
 - all V3b notebook code cells compile with Python `compile(...)`
 
-The full training run has not yet been executed in this local workspace. The next step is to run V3b in Colab, extract `results/v3b/`, and compare adjacent-CA in-band fraction, adjacent-CA mean, bond means, radius of gyration, collapse fraction, and poor CA-band fraction against V2 and V3.
+## V3b first run review: Geometry losses were logged but not active
+
+The first V3b Colab run was extracted from `results/v3b-20260607T093726Z-3-001.zip` into `results/v3b/`.
+
+### Training loss behavior
+
+The run used the intended settings:
+
+| Item | Value |
+|---|---:|
+| Device | NVIDIA L4 |
+| Epochs | 5 |
+| Batch size | 32 |
+| Model | `BackboneDenoiser` |
+| Parameters | 1,750,028 |
+| `lambda_bond` | 0.05 |
+| `lambda_ca` | 0.05 |
+| Radius loss | 0.0 |
+
+The history showed that validation total loss decreased from `0.3618` to `0.2059`, while validation noise loss followed the same trajectory as V2:
+
+| Epoch | Val total | Val noise | Val bond geometry | Val adjacent CA geometry | Val x0 RMSE |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.3618 | 0.1348 | 2.4149 | 2.1249 | 0.1879 |
+| 2 | 0.2836 | 0.1132 | 1.7408 | 1.6669 | 0.1755 |
+| 3 | 0.2615 | 0.1094 | 1.3741 | 1.6692 | 0.1756 |
+| 4 | 0.2096 | 0.0975 | 0.6721 | 1.5703 | 0.1651 |
+| 5 | 0.2059 | 0.1010 | 0.5360 | 1.5619 | 0.1607 |
+
+At first glance this looked encouraging: the bond geometry loss dropped substantially on validation, and adjacent CA geometry loss improved modestly.
+
+### Structural sample comparison
+
+The generated sample metrics, however, were exactly identical to V2:
+
+| Metric | Real mean | V2 generated | V3 generated | V3b first-run generated |
+|---|---:|---:|---:|---:|
+| Adjacent CA distance | 3.810 | 3.099 | 3.531 | 3.099 |
+| Adjacent CA in-band fraction | 0.999 | 0.265 | 0.258 | 0.265 |
+| N-CA distance | 1.464 | 1.212 | 1.360 | 1.212 |
+| CA-C distance | 1.525 | 1.254 | 1.361 | 1.254 |
+| C-O distance | 1.229 | 1.027 | 1.209 | 1.027 |
+| C-N distance | 1.330 | 1.196 | 1.233 | 1.196 |
+| Radius of gyration | 16.213 | 7.148 | 8.045 | 7.148 |
+
+Collapse comparison:
+
+| Version | Samples | Collapse fraction | Collapse count | Poor CA-band fraction | Poor CA-band count |
+|---|---:|---:|---:|---:|---:|
+| V2 | 32 | 0.969 | 31/32 | 1.000 | 32/32 |
+| V3 | 32 | 0.625 | 20/32 | 1.000 | 32/32 |
+| V3b first run | 32 | 0.969 | 31/32 | 1.000 | 32/32 |
+
+The exact equality to V2 is too strong to interpret as a normal experimental outcome. It indicates that V3b did not actually change the trained model relative to V2.
+
+### Root cause
+
+The issue was implementation-level. The shared helper `predict_x0` in `src/latent_structure_generation/backbone_diffusion.py` is decorated with `@torch.no_grad()`. V3b used that helper when computing geometry losses:
+
+```python
+x0_pred = predict_x0(x_t, t, pred_noise, schedule['alpha_bars'])
+```
+
+That meant:
+
+- geometry losses were computed and logged
+- geometry losses contributed numerically to `total_loss`
+- but geometry losses could not backpropagate into the denoiser, because `x0_pred` was detached from the computation graph
+- only the original noise MSE updated the model
+
+This explains why the V3b first-run noise losses, generated metrics, collapse summary, and sampled structures matched V2 exactly.
+
+### Correction made
+
+The V3b notebook has been corrected to use a local differentiable reconstruction:
+
+```python
+def differentiable_predict_x0(x_t, t, pred_noise, alpha_bars):
+    alpha_bar_t = alpha_bars[t].view(-1, 1, 1).to(device=x_t.device, dtype=x_t.dtype)
+    return (x_t - torch.sqrt(1.0 - alpha_bar_t) * pred_noise) / torch.sqrt(alpha_bar_t)
+```
+
+Training and fixed-timestep diagnostics now call `differentiable_predict_x0(...)` instead of the no-grad shared helper. The corrected notebook was revalidated locally:
+
+- `python3 -m json.tool notebooks/protein_backbone_diffusion_v3b.ipynb` passed
+- all V3b notebook code cells compile with Python `compile(...)`
+
+The first V3b run should therefore be treated as an invalid geometry-loss experiment but a useful debugging result. The corrected notebook needs a fresh Colab run before judging whether geometry-augmented denoising improves sample quality.
+
+### Interpretation
+
+The important insight is not that geometry losses failed. They were not active. The correct conclusion is:
+
+```text
+V3b first run reproduced V2 because the geometry terms were detached by a no-grad x0 reconstruction helper.
+```
+
+The real V3b test remains pending. After rerunning the corrected notebook, the key success metrics are still:
+
+- adjacent CA in-band fraction above the V2/V3 level around `0.26`
+- adjacent CA mean moving toward `3.8 A`
+- bond means moving toward real values
+- radius of gyration moving upward from the V2 value around `7.15`
+- collapse fraction dropping below V2 `31/32`, ideally below V3 `20/32`
+- poor CA-band count dropping below `32/32`
+
+## V3b corrected run report: Geometry loss changes the model but does not solve continuity
+
+The corrected V3b Colab run was extracted from `results/v3b-20260607T100118Z-3-001.zip` into `results/v3b/`. The zip file was deleted after extraction. This run used the corrected differentiable `x0_pred` reconstruction, so the geometry losses were active during training.
+
+### Training behavior
+
+Compared with V2, corrected V3b was only modestly slower, not V3-level slow:
+
+| Version | Mean epoch seconds | Best epoch | Best validation noise loss | Test noise at best epoch |
+|---|---:|---:|---:|---:|
+| V2 | 13.7 | 4 | 0.0975 | 0.0992 |
+| V3 | 124.3 | 4 | 0.1373 | 0.1393 |
+| V3b corrected | 16.6 | 5 | 0.1499 | 0.1538 |
+
+The geometry terms clearly affected optimization. Unlike the incorrect first run, corrected V3b no longer reproduced V2 losses or samples exactly. However, the cost was a substantially worse noise-prediction loss. Validation noise loss ended at `0.1499`, worse than both V2 and V3.
+
+Corrected V3b history:
+
+| Epoch | Val total | Val noise | Val bond geometry | Val adjacent CA geometry | Val x0 RMSE |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.3665 | 0.1809 | 1.5838 | 2.1285 | 0.2049 |
+| 2 | 0.3244 | 0.1671 | 1.4070 | 1.7394 | 0.1937 |
+| 3 | 0.3374 | 0.2140 | 1.0467 | 1.4212 | 0.2072 |
+| 4 | 0.2537 | 0.1617 | 0.6714 | 1.1701 | 0.1865 |
+| 5 | 0.2267 | 0.1499 | 0.6751 | 0.8619 | 0.1804 |
+
+The validation bond and adjacent-CA geometry losses did decrease, which confirms the added objective is now active. The model is being pushed toward shorter-range geometric targets, but that did not translate into valid generated chains.
+
+### Generated structure comparison
+
+Corrected V3b made some local means better, but worsened the decisive chain-continuity and collapse indicators.
+
+| Metric | Real mean | V2 generated | V3 generated | V3b corrected | V3b vs V2 |
+|---|---:|---:|---:|---:|---:|
+| Adjacent CA distance | 3.810 | 3.099 | 3.531 | 3.332 | +0.233 |
+| Adjacent CA in-band fraction | 0.999 | 0.265 | 0.258 | 0.152 | -0.113 |
+| N-CA distance | 1.464 | 1.212 | 1.360 | 1.284 | +0.072 |
+| CA-C distance | 1.525 | 1.254 | 1.361 | 1.342 | +0.089 |
+| C-O distance | 1.229 | 1.027 | 1.209 | 1.037 | +0.010 |
+| C-N distance | 1.330 | 1.196 | 1.233 | 1.541 | +0.345 |
+| Radius of gyration | 16.213 | 7.148 | 8.045 | 6.873 | -0.275 |
+
+Interpretation:
+
+- Adjacent CA mean improved relative to V2, moving from `3.099` to `3.332`, but it remains below the real value around `3.81`.
+- The adjacent CA in-band fraction got worse, dropping from `0.265` to `0.152`. This matches the visual observation of more discontinuous chains: average spacing moved in the right direction, but the distribution is less consistently in the acceptable band.
+- N-CA and CA-C improved relative to V2, while C-O barely improved.
+- Adjacent C-N overshot badly to `1.541` versus the real `1.330`, suggesting the simple geometry objective is pulling parts of the backbone unevenly.
+- Radius of gyration fell from `7.148` to `6.873`, so corrected V3b is slightly more collapsed by this metric, not less.
+
+Collapse comparison:
+
+| Version | Samples | Collapse fraction | Collapse count | Poor CA-band fraction | Poor CA-band count |
+|---|---:|---:|---:|---:|---:|
+| V2 | 32 | 0.969 | 31/32 | 1.000 | 32/32 |
+| V3 | 32 | 0.625 | 20/32 | 1.000 | 32/32 |
+| V3b corrected | 32 | 0.969 | 31/32 | 1.000 | 32/32 |
+
+Corrected V3b did not reduce collapse count or poor CA-band count. It remained at the V2 failure level for both binary summaries.
+
+### Interpretation
+
+Corrected V3b is a useful negative result. It proves that geometry losses can change the learned model, because generated metrics are no longer identical to V2. But the particular implementation, weights, and raw Cartesian DDPM sampling setup did not improve the main failure mode.
+
+The most important observation is the split between mean-distance improvement and band-quality degradation:
+
+```text
+V3b improved average adjacent CA distance, but worsened the fraction of adjacent CA distances in the valid band.
+```
+
+That is consistent with visually discontinuous chains. A scalar mean can move toward the target while the distribution remains broad or multimodal. For protein generation, the in-band fraction is more important than the mean.
+
+The corrected V3b result suggests:
+
+- simple unweighted target-distance penalties on `x0_pred` are not enough
+- geometry losses can fight the DDPM noise objective and worsen denoising loss
+- stronger local objectives may need robust/clipped losses, timestep weighting, or sampling-time projection/guidance
+- architecture still matters: V3 had better radius and collapse than V3b despite worse noise loss
+
+### Recommended next step
+
+Do not spend many more epochs on this exact V3b configuration. The validation geometry losses were still improving, but the generated samples show the objective is not targeting the right failure cleanly.
+
+Better follow-up options:
+
+1. Add distribution-aware diagnostics for generated adjacent CA distances, not just means.
+2. Try a gentler geometry objective:
+   - lower weights such as `lambda_bond = 0.01`, `lambda_ca = 0.01`
+   - or apply geometry loss only at mid/late denoising timesteps
+   - or use Huber/soft-clipped distance loss to avoid overcorrecting bad predictions
+3. Consider sampling-time geometry guidance or projection rather than training-only penalties.
+4. Move to V4 EGNN only with the lesson that architecture and objective both matter.
+
+### V3b corrected claim
+
+```text
+I tested a corrected geometry-augmented DDPM objective on the faster V2 denoiser. The geometry terms were active and changed the generated samples, improving some average local distances, but they worsened adjacent-CA band quality, did not reduce collapse, and degraded denoising loss. This suggests that naive x0 bond-distance penalties are insufficient; future work should use more stable geometry objectives, sampling guidance/projection, or combine protein-aware losses with a stronger equivariant architecture.
+```
+
+## V3b safer geometry objective refactor
+
+After the corrected V3b run, the notebook was refactored for a gentler follow-up experiment rather than continuing with the aggressive plain-MSE geometry setup.
+
+The new V3b configuration keeps the same fast V2 denoiser and same output path, but changes the geometry objective:
+
+| Setting | Previous corrected V3b | Refactored V3b |
+|---|---:|---:|
+| Bond geometry weight | 0.05 | 0.01 |
+| Adjacent CA geometry weight | 0.05 | 0.01 |
+| Geometry loss type | Squared error | Smooth L1 / Huber |
+| Smooth L1 beta | n/a | 0.5 |
+| Geometry timestep range | all timesteps | `t <= 50` |
+| Radius loss | 0.0 | 0.0 |
+
+Rationale:
+
+- the previous active geometry losses degraded validation noise loss too much
+- high-noise `x0_pred` estimates are unstable, so precise bond penalties are only applied at lower/mid timesteps
+- Smooth L1 should reduce the impact of extreme early distance errors
+- lower weights should preserve more of the V2 denoising behavior while still giving geometry a signal
+
+The notebook now also saves `v3b_adjacent_ca_distribution_summary`, because the previous corrected run showed that adjacent CA mean can improve while the adjacent CA in-band fraction gets worse. The next run should judge the distribution and in-band fraction, not just the mean.
+
+Local validation after this refactor:
+
+- `python3 -m json.tool notebooks/protein_backbone_diffusion_v3b.ipynb` passed
+- all V3b notebook code cells compile with Python `compile(...)`
