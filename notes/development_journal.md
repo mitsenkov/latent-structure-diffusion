@@ -851,3 +851,286 @@ Local validation after this refactor:
 
 - `python3 -m json.tool notebooks/protein_backbone_diffusion_v3b.ipynb` passed
 - all V3b notebook code cells compile with Python `compile(...)`
+
+## V3b stable-geometry run report: modest improvement over V2
+
+The safer refactored V3b run was extracted from `results/v3b-20260607T102254Z-3-001.zip` into `results/v3b/`. This is the current canonical V3b result.
+
+### Setup
+
+This run used the gentler geometry objective:
+
+| Setting | Value |
+|---|---:|
+| Model | `BackboneDenoiser` |
+| Parameters | 1,750,028 |
+| Epochs | 5 |
+| Batch size | 32 |
+| `lambda_bond` | 0.01 |
+| `lambda_ca` | 0.01 |
+| Geometry loss type | Smooth L1 |
+| Smooth L1 beta | 0.5 |
+| Geometry active timesteps | `t <= 50` |
+| Radius loss | 0.0 |
+
+### Training behavior
+
+The stable V3b objective preserved the denoising baseline much better than the aggressive geometry-loss run.
+
+| Version | Mean epoch seconds | Best epoch | Best validation noise loss | Test noise at best epoch |
+|---|---:|---:|---:|---:|
+| V2 | 13.7 | 4 | 0.0975 | 0.0992 |
+| V3 | 124.3 | 4 | 0.1373 | 0.1393 |
+| V3b aggressive | 16.6 | 5 | 0.1499 | 0.1538 |
+| V3b stable | 17.2 | 4 | 0.1005 | 0.1024 |
+
+The stable V3b run is only slightly slower than V2 and keeps validation/test noise loss close to V2. This is a much better optimization tradeoff than the aggressive corrected V3b run.
+
+Stable V3b history:
+
+| Epoch | Val total | Val noise | Val bond geometry | Val adjacent CA geometry | Val x0 RMSE |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.1444 | 0.1351 | 0.2909 | 0.6303 | 0.1919 |
+| 2 | 0.1188 | 0.1127 | 0.2252 | 0.3860 | 0.1744 |
+| 3 | 0.1171 | 0.1112 | 0.1796 | 0.4092 | 0.1720 |
+| 4 | 0.1050 | 0.1005 | 0.1688 | 0.2819 | 0.1674 |
+| 5 | 0.1052 | 0.1007 | 0.1592 | 0.2889 | 0.1635 |
+
+### Generated structure comparison
+
+Stable V3b improved the targeted local trace metrics modestly relative to V2 and the aggressive V3b run.
+
+| Metric | Real mean | V2 generated | V3 generated | V3b aggressive | V3b stable |
+|---|---:|---:|---:|---:|---:|
+| Adjacent CA distance | 3.810 | 3.099 | 3.531 | 3.332 | 3.219 |
+| Adjacent CA in-band fraction | 0.999 | 0.265 | 0.258 | 0.152 | 0.300 |
+| N-CA distance | 1.464 | 1.212 | 1.360 | 1.284 | 1.279 |
+| CA-C distance | 1.525 | 1.254 | 1.361 | 1.342 | 1.310 |
+| C-O distance | 1.229 | 1.027 | 1.209 | 1.037 | 1.016 |
+| C-N distance | 1.330 | 1.196 | 1.233 | 1.541 | 1.206 |
+| Radius of gyration | 16.213 | 7.148 | 8.045 | 6.873 | 7.303 |
+
+Relative to V2:
+
+- adjacent CA mean improved from `3.099` to `3.219`
+- adjacent CA in-band fraction improved from `0.265` to `0.300`
+- radius of gyration improved from `7.148` to `7.303`
+- N-CA and CA-C means moved closer to real
+- C-N avoided the aggressive run's overshoot and stayed near V2
+
+The adjacent CA distribution summary confirms the improvement:
+
+| Kind | Mean adjacent CA | Median adjacent CA | CA in-band mean | CA in-band median |
+|---|---:|---:|---:|---:|
+| Real | 3.810 | 3.806 | 0.999 | 1.000 |
+| V3b stable generated | 3.219 | 3.205 | 0.300 | 0.305 |
+
+For generated samples, the adjacent-CA in-band interquartile range was roughly `0.240` to `0.353`, and the 95th percentile reached `0.406`. That is still far from protein-like, but it is a real improvement over V2's mean `0.265`.
+
+### Collapse summary
+
+Stable V3b did not improve the binary collapse or poor-CA-band counts:
+
+| Version | Samples | Collapse fraction | Collapse count | Poor CA-band fraction | Poor CA-band count |
+|---|---:|---:|---:|---:|---:|
+| V2 | 32 | 0.969 | 31/32 | 1.000 | 32/32 |
+| V3 | 32 | 0.625 | 20/32 | 1.000 | 32/32 |
+| V3b stable | 32 | 0.969 | 31/32 | 1.000 | 32/32 |
+
+This means the visual improvement is not strong enough to cross the current collapse threshold. Stable V3b is less bad than V2 on mean radius and CA-band fraction, but it still mostly samples compact structures.
+
+### Interpretation
+
+Stable V3b is the first V3b result that genuinely supports the geometry-loss idea. It is not a solution, but it improves the right local metrics without destroying the DDPM objective.
+
+The key lesson is:
+
+```text
+Geometry supervision helps only when it is gentle and applied where x0 predictions are stable enough.
+```
+
+Compared with aggressive V3b, the safer objective:
+
+- restored noise loss close to V2
+- improved CA in-band fraction instead of damaging it
+- improved radius of gyration slightly
+- avoided the adjacent C-N overshoot
+
+Compared with V3, the result is mixed:
+
+- V3 still has better adjacent CA mean, radius of gyration, and collapse count
+- stable V3b has better CA in-band fraction and is about 7x faster per epoch
+- both still fail the poor-CA-band criterion for all generated samples
+
+### Recommended next step
+
+The stable V3b result is worth extending. The next run should increase training length before changing the architecture again.
+
+Recommended follow-up:
+
+1. Run stable V3b for `10` epochs with the same settings.
+2. Compare epoch-5 and epoch-10 generated metrics, especially:
+   - adjacent CA in-band fraction
+   - radius of gyration
+   - collapse count
+   - bond means
+   - validation noise loss
+3. If 10 epochs improves CA in-band and radius without hurting noise loss, use stable V3b as the best fast baseline.
+4. If 10 epochs plateaus, then consider either sampling-time projection/guidance or V4 EGNN.
+
+### V3b stable claim
+
+```text
+I refined the V3b geometry objective using lower weights, Smooth L1 distance penalties, and timestep gating. This stable geometry-loss variant preserved V2-like denoising loss while modestly improving adjacent CA in-band fraction, adjacent CA mean, radius of gyration, and selected bond lengths. It still did not fix global collapse or poor CA-band failures, but it shows that careful geometry supervision can move the generator in the right direction without the severe degradation seen in the aggressive V3b run.
+```
+
+## V3b stable 100-epoch run report: the first clearly useful generation improvement
+
+The stable V3b notebook was then rerun for `100` epochs with the same objective:
+
+```text
+lambda_bond = 0.01
+lambda_ca = 0.01
+geometry loss = Smooth L1
+geometry active for t <= 50
+```
+
+This produced the strongest result so far.
+
+### Training behavior
+
+The model continued improving well beyond 5 epochs. The best validation total loss occurred at epoch `86`.
+
+| Run | Epochs | Best epoch | Best val total | Best val noise | Test noise at best |
+|---|---:|---:|---:|---:|---:|
+| V2 | 5 | 4 | n/a | 0.0975 | 0.0992 |
+| V3 | 5 | 4 | n/a | 0.1373 | 0.1393 |
+| V3b stable | 5 | 4 | 0.1050 | 0.1005 | 0.1024 |
+| V3b stable long | 100 | 86 | 0.0699 | 0.0688 | 0.0742 |
+
+This is important. The long V3b run no longer just preserves the DDPM objective; it surpasses the earlier noise-loss baselines on held-out data.
+
+One evaluation caveat matters here: the notebook saves the best-validation checkpoint, but the sampling/evaluation section still uses the in-memory model after the final epoch unless the checkpoint is explicitly reloaded. So the structural metrics extracted from this run most likely correspond to the epoch-100 model, while the best validation row was epoch `86`. Sampling from the saved best checkpoint may be slightly better than the current exported metrics.
+
+### Structural sample comparison
+
+The 100-epoch run improved the most important structural indicators sharply relative to V2, V3, and the 5-epoch stable V3b run.
+
+| Metric | Real mean | V2 | V3 | V3b stable 5 ep | V3b stable 100 ep |
+|---|---:|---:|---:|---:|---:|
+| Adjacent CA mean | 3.810 | 3.099 | 3.531 | 3.219 | 3.162 |
+| Adjacent CA in-band fraction | 0.999 | 0.265 | 0.258 | 0.300 | 0.728 |
+| N-CA distance | 1.464 | 1.212 | 1.360 | 1.279 | 1.151 |
+| CA-C distance | 1.525 | 1.254 | 1.361 | 1.310 | 1.190 |
+| C-O distance | 1.229 | 1.027 | 1.209 | 1.016 | 0.964 |
+| C-N distance | 1.330 | 1.196 | 1.233 | 1.206 | 1.269 |
+| Radius of gyration | 16.213 | 7.148 | 8.045 | 7.303 | 7.855 |
+
+The best signs are:
+
+- adjacent CA in-band fraction jumped from `0.300` at 5 epochs to `0.728` at 100 epochs
+- radius of gyration rose from `7.303` to `7.855`
+- collapse count dropped from `31/32` to `19/32`
+- poor CA-band count dropped from `32/32` to `18/32`
+
+This is the first result where the binary structural summaries improved strongly rather than just the means.
+
+### Adjacent-CA distribution interpretation
+
+The adjacent-CA distribution summary is especially informative:
+
+| Kind | Mean adjacent CA | Median adjacent CA | CA in-band mean | CA in-band median |
+|---|---:|---:|---:|---:|
+| Real | 3.810 | 3.806 | 0.999 | 1.000 |
+| V3b stable 100 ep generated | 3.162 | 3.268 | 0.728 | 0.760 |
+
+This resolves the ambiguity from earlier runs. The mean adjacent CA distance alone is not spectacular, but the chain-level in-band fraction is now much better. That matches the visual observation of more coherent helices and less tangled local structure.
+
+The tradeoff is that some bond means drifted away from the ideal values, especially `N-CA`, `CA-C`, and `C-O`. So the model appears to be learning a better C-alpha trace and less collapsed topology before fully recovering atom-level bond geometry.
+
+### Collapse summary
+
+| Version | Samples | Collapse fraction | Collapse count | Poor CA-band fraction | Poor CA-band count |
+|---|---:|---:|---:|---:|---:|
+| V2 | 32 | 0.969 | 31/32 | 1.000 | 32/32 |
+| V3 | 32 | 0.625 | 20/32 | 1.000 | 32/32 |
+| V3b stable 5 ep | 32 | 0.969 | 31/32 | 1.000 | 32/32 |
+| V3b stable 100 ep | 32 | 0.594 | 19/32 | 0.562 | 18/32 |
+
+This is the strongest evidence that the long stable V3b run is materially better. It slightly beats V3 on collapse count while dramatically outperforming V3 on poor-CA-band count.
+
+### Interpretation
+
+The 100-epoch run changes the project picture.
+
+The earlier conclusion was:
+
+```text
+Geometry supervision is only a mild local improvement.
+```
+
+The new conclusion is:
+
+```text
+Stable geometry supervision plus longer training materially improves sampled backbone continuity and reduces collapse.
+```
+
+That does not mean the problem is solved. Global compactness is still poor relative to real proteins, and several bond means remain too short. But the generator is no longer just producing uniformly broken local geometry. It is now clearly recovering a meaningful amount of backbone-like structure.
+
+This also answers the earlier epoch question: for this stable V3b setup, `5` epochs was too short to reveal the real effect. The geometry-aware model needed much longer training to turn local supervision into visible structural gains.
+
+### What the model currently penalizes
+
+The current V3b objective penalizes only a small protein-backbone subset of distances:
+
+- intra-residue `N-CA`
+- intra-residue `CA-C`
+- intra-residue `C-O`
+- inter-residue `C-N`
+- adjacent `CA-CA`
+
+It does **not** penalize:
+
+- all pairwise atom distances
+- nonlocal CA-CA distances
+- radius of gyration directly
+- clashes directly
+- torsion angles directly
+
+So the improvements seen here came from a very limited local-geometry objective.
+
+### Recommended next step
+
+Do not jump to V4 yet. The current evidence says the stable V3b line still has headroom.
+
+Best next experiments:
+
+1. Keep the same stable V3b objective and test a modestly longer run window with checkpointed sampling summaries, for example every `10` epochs.
+2. Add a lightweight global anti-collapse term only after preserving the current local-trace gains.
+3. Prefer a gentle global regularizer or sampling-time guidance over an aggressive radius loss.
+
+The most defensible next modification would be one of:
+
+- a weak collapse penalty based on radius or spread, with a very small weight
+- a weak nonlocal CA-distance consistency term
+- sampling-time geometry guidance/projection
+
+I would avoid changing the architecture immediately, because the current objective is finally showing that it can work.
+
+### V3b stable 100-epoch claim
+
+```text
+The stable geometry-augmented V3b model became substantially better when trained longer. At 100 epochs it preserved strong denoising performance, raised adjacent CA in-band fraction from 0.265 to 0.728, improved radius of gyration, reduced collapse from 31/32 to 19/32, and reduced poor CA-band failures from 32/32 to 18/32. The model still collapses globally and does not yet match real bond geometry, but it is now recovering meaningful backbone-like structure, including visible alpha-helical segments.
+```
+
+### V3c implementation note: gentle anti-collapse term
+
+V3c should start from the stable V3b objective rather than changing the architecture again. The only new training term is a tiny lower-bound penalty on CA radius of gyration computed from `x0_pred`.
+
+The point of V3c is narrow:
+
+- improve radius of gyration enough to discourage obvious collapse
+- reduce collapse count and poor CA-band count
+- preserve the V3b local-geometry gains as much as possible
+
+The anti-collapse term should remain soft. It should do nothing once a structure is above a conservative radius threshold, and it should stay small enough that validation noise loss and adjacent CA in-band fraction are not destroyed.
