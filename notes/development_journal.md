@@ -1598,3 +1598,1420 @@ The first thing to inspect after rerunning is not just validation total loss. It
 - bond and adjacent-CA losses begin moving down
 
 If those move in the right direction, V4 becomes a meaningful architecture experiment instead of a failed smoke run.
+
+## V4 troubleshooting continuation: what the debugging actually showed
+
+After the first architecture patch, the next phase of V4 work was not "train once and declare success." It became a structured troubleshooting pass to separate three possibilities:
+
+- the EGNN implementation is broken
+- the EGNN implementation works, but the output parameterization is still too weak
+- the implementation is basically viable, but full-run optimization is much harder than tiny-subset fitting
+
+### First post-patch full-run behavior
+
+The early post-patch full runs still looked discouraging.
+
+One representative run with a more conservative setup showed:
+
+```text
+lr = 5e-4
+grad_clip_norm = 0.5
+sequence_offset_edges = (8, 16)
+```
+
+and produced:
+
+```text
+Epoch 01:
+train total 0.75168
+val total 0.72620
+val noise 0.65217
+val bond 4.1500
+val CA 3.2528
+train pred rms 0.3140
+val pred rms 0.3257
+val near-zero 0.005
+
+Epoch 05:
+train total 0.74087
+val total 0.73755
+val noise 0.66599
+val bond 4.0166
+val CA 3.1384
+train pred rms 0.3203
+val pred rms 0.3132
+val near-zero 0.005
+```
+
+Interpretation:
+
+- the model was no longer dead-zero
+- near-zero fraction was already low, so the explicit output head had fixed the worst bottleneck
+- but predicted-noise RMS was still stuck around `0.31` to `0.33`
+- losses barely moved
+
+So the old failure mode changed. V4 was no longer "not producing anything." It was producing a weak, low-amplitude, underpowered prediction.
+
+### More aggressive full-run hyperparameters
+
+A stronger full configuration was tried:
+
+```text
+lr = 1e-3
+grad_clip_norm = 1.0
+hidden_dim = 256
+sequence_offset_edges = (8, 16, 32)
+```
+
+That made epochs slower, around `105s` on A100, but still did not materially fix the weak-learning pattern. The key observation was that `pred rms` stayed pinned near `0.32`, which argued against "just raise LR" as the main answer.
+
+This led to a more disciplined debugging step:
+
+- stop spending full-run compute
+- test whether the model can overfit a tiny subset at all
+
+### Overfit-debug mode was added
+
+To make this practical, V4 gained an env-controlled overfit-debug mode in the notebook loader section. The purpose was:
+
+- train on a tiny subset of train chunks
+- optionally evaluate on that same train subset
+- see whether V4 can overfit the denoising task and the geometry-augmented objective at all
+
+There was some Colab friction while testing this:
+
+- notebook-file changes in the local repo did not automatically affect the already-open Colab runtime
+- shell-style `export` commands did not reliably propagate to later Python cells in Colab
+- eventually the simplest reliable path was to hardcode the overfit settings in the notebook cell for diagnosis
+
+Once overfit-debug was definitely active, epoch time dropped to about `1.0` to `1.3s`, confirming that the loader was really using the tiny subset.
+
+### Noise-only overfit result
+
+With geometry losses disabled:
+
+```text
+lambda_bond = 0.0
+lambda_ca = 0.0
+```
+
+the tiny-subset run showed clear learning.
+
+Representative behavior over 30 epochs:
+
+- train total/noise dropped from about `0.997` to about `0.523`
+- validation-on-train-subset noise dropped from about `0.993` to about `0.523`
+- train predicted-noise RMS rose from about `0.05` to about `0.53`
+- validation predicted-noise RMS rose to about `0.57`
+- near-zero fraction stayed very low
+
+Interpretation:
+
+- V4 can learn the DDPM noise task
+- the explicit hidden-state output head is working
+- the architecture is not fundamentally broken
+
+### Geometry-augmented overfit result
+
+The next key test was whether the original V3b geometry objective was itself learnable in V4 overfit mode.
+
+Using:
+
+```text
+lambda_bond = 0.01
+lambda_ca = 0.01
+sequence_offset_edges = (8, 16)
+lr = 1e-3
+grad_clip_norm = 1.0
+```
+
+the tiny-subset run also learned meaningfully.
+
+Representative pattern:
+
+- train total fell from about `1.11` to about `0.65`
+- validation total fell from about `1.12` to about `0.64`
+- validation noise fell from about `0.99` to about `0.58`
+- predicted-noise RMS climbed from near zero to around `0.5` to `0.6`
+- geometry losses were noisy, but not frozen
+
+Interpretation:
+
+- the geometry-augmented objective is not impossible for V4
+- V4 can fit both denoising and geometry terms on a tiny subset
+- therefore the old flatlined full-run behavior is much more likely a scaling / throughput / optimization-at-dataset-scale issue than a basic correctness bug
+
+This was the reassuring evidence that the V4 redesign was not wasted work.
+
+### First more-promising full-data signal
+
+After turning overfit debug back off and running a lighter full-data configuration:
+
+```text
+lr = 1e-3
+grad_clip_norm = 1.0
+sequence_offset_edges = (8, 16)
+lambda_bond = 0.01
+lambda_ca = 0.01
+```
+
+the first full epoch produced a much healthier signal than the earlier flat runs:
+
+```text
+Epoch 01:
+train total 0.25810
+val total 0.15741
+val noise 0.14786
+val bond 0.2244
+val CA 0.7307
+train pred rms 0.8629
+val pred rms 0.9068
+val near-zero 0.001
+epoch time 195.4s on L4
+```
+
+This no longer looks like the old weak-amplitude regime:
+
+- predicted-noise RMS is now high rather than pinned near `0.32`
+- noise loss is much lower
+- geometry losses are much smaller
+- near-zero fraction is tiny
+
+The main problem at this stage is no longer obvious model failure. The main problem is runtime:
+
+- one epoch on L4 took about `195s`
+
+So the working interpretation became:
+
+- V4 now appears viable enough to justify continued training
+- the immediate bottleneck is wall-clock throughput, not the original learning bottleneck
+- A100 is likely the right hardware for meaningful V4 iteration from this point onward
+
+### Practical conclusions from the troubleshooting phase
+
+The V4 debugging trail now supports a much more defensible story:
+
+1. The original coordinate-delta-only prediction path was too constrained.
+2. Adding a direct hidden-state noise head and raw-coordinate conditioning fixed the dead-output problem.
+3. Tiny-subset overfit showed that:
+   - the denoising task is learnable
+   - the geometry-augmented objective is also learnable
+4. Full-run difficulties therefore should not be interpreted as "V4 is broken."
+5. The current remaining issue is training efficiency and stability at full scale, not obvious architectural invalidity.
+
+### What should be monitored next
+
+For the next more stable V4 runs, the most important metrics to watch are:
+
+- train total loss
+- validation total loss
+- validation noise loss
+- train and validation predicted-noise RMS
+- near-zero prediction fraction
+- bond geometry loss
+- adjacent CA geometry loss
+
+The reassuring pattern to look for is:
+
+- predicted-noise RMS stays healthy rather than collapsing
+- near-zero fraction stays very low
+- train loss continues moving down
+- validation noise does not flatten in the old `0.65` to `0.67` band
+- geometry losses stay much smaller than in the original failed V4 smoke runs
+
+If that pattern persists, V4 should be treated as a computationally expensive but now credible architecture test, not a failed branch.
+
+## V4 first-iteration conclusion from the A100 full run
+
+The first full V4 iteration that should be treated as the real reference run is the A100 run archived as:
+
+```text
+results/v4-20260607T212644Z-3-001.zip
+```
+
+This run used the now-stable patched V4 setup:
+
+```text
+hidden_dim = 192
+num_layers = 4
+sequence_offset_edges = (8, 16)
+lr = 1e-3
+grad_clip_norm = 1.0
+lambda_bond = 0.01
+lambda_ca = 0.01
+geometry_loss_beta = 0.5
+geometry_max_timestep = 50
+no radius loss
+device = NVIDIA A100-SXM4-80GB
+```
+
+### Training outcome
+
+This run is the point where V4 should no longer be described as "not learning." It clearly learned.
+
+Best epoch by validation total loss was epoch `28` with:
+
+```text
+train total = 0.1130
+train noise = 0.1041
+val total = 0.1011
+val noise = 0.0990
+val bond = 0.1135
+val CA = 0.0921
+test total = 0.1042
+test noise = 0.1022
+```
+
+Important diagnostic values at the best epoch:
+
+```text
+train pred_noise_rms = 0.9450
+val pred_noise_rms = 0.9448
+test pred_noise_rms = 0.9423
+train near_zero_fraction = 0.000843
+val near_zero_fraction = 0.000843
+test near_zero_fraction = 0.000881
+```
+
+Interpretation:
+
+- the old low-amplitude failure mode is gone
+- the model is no longer stuck near zero predictions
+- the explicit hidden-state noise head is active and stable
+- V4 can train end to end on the full dataset under the V3b objective
+
+This is the main success of the first V4 troubleshooting iteration.
+
+### Structural sample outcome
+
+The sample-quality tables show that V4 materially improved on V3b in local geometry and collapse behavior.
+
+Generated-sample summary for 32 validation-shaped masks:
+
+```text
+mean adjacent CA = 3.7403
+adjacent CA in-band fraction = 0.8587
+mean N-CA = 1.3903
+mean CA-C = 1.4421
+mean C-O = 1.1716
+mean C-N = 1.4004
+mean radius of gyration = 8.3477
+collapse count = 10 / 32
+poor CA-band count = 5 / 32
+```
+
+Real reference summary for the same mask set:
+
+```text
+mean adjacent CA = 3.8104
+adjacent CA in-band fraction = 0.9986
+mean radius of gyration = 16.2135
+```
+
+### Direct comparison against V3b
+
+Compared with the current V3b reference:
+
+```text
+V3b mean adjacent CA = 3.1619
+V4  mean adjacent CA = 3.7403
+
+V3b adjacent CA in-band fraction = 0.7276
+V4  adjacent CA in-band fraction = 0.8587
+
+V3b mean radius of gyration = 7.8554
+V4  mean radius of gyration = 8.3477
+
+V3b collapse count = 19 / 32
+V4  collapse count = 10 / 32
+
+V3b poor CA-band count = 18 / 32
+V4  poor CA-band count = 5 / 32
+```
+
+This is the most important scientific outcome of the first V4 iteration:
+
+- V4 did not beat V3b on validation denoising loss
+- but V4 did beat V3b clearly on the downstream structural metrics that mattered most in earlier analysis
+- especially:
+  - adjacent CA spacing
+  - CA-band quality
+  - collapse frequency
+
+So V4 is not the best pure denoising model yet, but it is already the strongest architecture tried so far for sample geometry and anti-collapse behavior.
+
+### Trade-off summary
+
+The first V4 iteration established a real trade-off:
+
+- V3b remains the stronger loss baseline
+- V4 is much slower and more expensive to train
+- but V4 produces substantially better local geometry and less collapse in generated samples
+
+This means V4 is now a credible branch worth continuing, not a failed experiment.
+
+For clarity: the best trained checkpoint in the V4 family remains the plain V4 A100 reference run. V4a and V4c are downstream diagnostics / sampling-guidance branches built on that line, not replacement training baselines that have already surpassed it.
+
+### Honest limitations
+
+The first V4 iteration is promising, but it is not final.
+
+Remaining limitations:
+
+- V4 denoising loss still trails V3b
+- generated radius of gyration is still far below real structures
+- global compactness is improved, but not solved
+- V4 is computationally expensive:
+  - around `75s` per epoch on A100
+  - compared with much cheaper V3b training
+
+So the correct conclusion is not "V4 solved the task." The correct conclusion is:
+
+- the EGNN-style coordinate-aware denoiser is now validated as a meaningful architecture direction
+- the first full V4 run successfully converted earlier debugging work into a real structural improvement over V3b
+- the next V4 work should focus on improving efficiency and preserving the new geometry gains while trying to close the remaining denoising-loss gap
+
+### Bottom-line claim for the notebook
+
+The first V4 troubleshooting iteration succeeded.
+
+It demonstrated that:
+
+1. the original V4 failure was not fundamental
+2. the patched V4 architecture can train stably on the full dataset
+3. V4 materially improves structural sample quality over the V3b baseline
+4. V4 is now strong enough to justify further iteration as a real candidate model rather than a speculative branch
+
+## V4 follow-up decision: do not keep `(8, 16, 32)` as the default edge set
+
+After the first successful V4 reference run with:
+
+```text
+sequence_offset_edges = (8, 16)
+```
+
+the most obvious next test was to add one more longer-range sparse CA edge:
+
+```text
+sequence_offset_edges = (8, 16, 32)
+```
+
+The motivation was reasonable:
+
+- V4 already improved local geometry and collapse behavior
+- the remaining weakness was still global compactness
+- adding one more sparse nonlocal offset was the cleanest low-complexity test of whether extra sequence-range context would help
+
+However, the early results argue against keeping this as the new default.
+
+### Observed early run behavior
+
+The `(8, 16, 32)` run produced:
+
+```text
+Epoch 01:
+train total 0.26366
+val total 0.16007
+val noise 0.15002
+val bond 0.2263
+val CA 0.7781
+train pred rms 0.8601
+val pred rms 0.9154
+epoch time 218.5s
+
+Epoch 02:
+train total 0.17130
+val total 0.15090
+val noise 0.14287
+val bond 0.2017
+val CA 0.6016
+train pred rms 0.9153
+val pred rms 0.9193
+epoch time 218.9s
+
+Epoch 03:
+train total 0.16294
+val total 0.14713
+val noise 0.13976
+val bond 0.1908
+val CA 0.5459
+train pred rms 0.9187
+val pred rms 0.9289
+epoch time 218.7s
+```
+
+### Comparison against the `(8, 16)` reference run
+
+The key point is not that `(8, 16, 32)` failed completely. It did not.
+
+The key point is that:
+
+- the optimization behavior is in roughly the same regime as the successful `(8, 16)` run
+- but runtime is dramatically worse
+
+Reference `(8, 16)` A100 run:
+
+- around `75s` per epoch
+
+Observed `(8, 16, 32)` A100 run:
+
+- around `219s` per epoch
+
+So adding the `32` offset made the model roughly three times slower, without immediate evidence of a comparably large quality gain.
+
+### Practical conclusion
+
+At this stage, `(8, 16, 32)` does not look like the right default trade-off for V4.
+
+The current working decision should be:
+
+- keep `(8, 16)` as the practical V4 default edge set
+- treat `(8, 16, 32)` as useful negative evidence about scaling cost
+- only revisit richer offset sets later if there is a much stronger reason or if runtime becomes less important
+
+This is an important outcome because it prevents the V4 branch from drifting into "more edges must be better" thinking.
+
+The evidence so far suggests:
+
+- a small amount of sparse nonlocal context helps
+- too much additional fixed sequence-offset connectivity becomes expensive very quickly
+- the current V4 value comes from improved structural quality at a still-manageable training cost
+- `(8, 16)` is therefore the better default for continuing iteration
+
+## V4a early archive inspection: diagnostics scaffold present, but not yet a real anti-collapse experiment
+
+Reviewed archive:
+
+- `results/v4a-20260607T232548Z-3-001.zip`
+
+### What the archive clearly shows
+
+The V4a notebook scaffolding is present:
+
+- saved training history
+- saved timestep diagnostics
+- saved V4a run config
+- saved small preview real/generated evaluation tables
+
+However, the archive does **not** yet contain the full guided-sampling comparison artifacts that V4a was intended to produce.
+
+No files corresponding to guided conditions or pooled nonlocal-compactness summaries were present in the zip. In practice, this means the run stopped after the training / preview stage rather than completing the actual anti-collapse sampling comparison.
+
+### Configuration mismatch versus the working V4 reference
+
+The saved V4a run config shows that this run was **not** using the settled practical V4 baseline defaults.
+
+Saved V4a config from the archive:
+
+- `model_hidden_dim = 256`
+- `model_num_layers = 4`
+- `model_sequence_offset_edges = 8,16,32`
+- `learning_rate = 1e-3`
+- `grad_clip_norm = 1.0`
+- `lambda_bond = 0.01`
+- `lambda_ca = 0.01`
+- `geometry_loss_beta = 0.5`
+- `geometry_max_timestep = 50`
+- `use_nonlocal_ca_guidance_default = False`
+- `guidance_threshold_angstrom_default = 8.0`
+- `guidance_scale_default = 0.0`
+
+This matters because the successful practical V4 reference was:
+
+- `hidden_dim = 192`
+- `sequence_offset_edges = (8, 16)`
+
+So this archive represents a heavier `(256, 8/16/32)` training variant plus preview evaluation, not a clean "V4 baseline + V4a guidance" experiment.
+
+### Preview metrics from the archive
+
+The preview generated-vs-real mean table showed:
+
+- generated mean adjacent CA: `3.483`
+- generated adjacent-CA in-band fraction: `0.511`
+- generated radius of gyration: `7.737`
+
+Real preview mean table showed:
+
+- real mean adjacent CA: `3.813`
+- real adjacent-CA in-band fraction: `0.999`
+- real radius of gyration: `16.901`
+
+These preview generated metrics are poor and strongly compacted. They are also noticeably worse than the full successful V4 reference run.
+
+### Why this does not invalidate V4
+
+This archive should not be interpreted as "V4a disproved the V4 progress".
+
+Instead, the more accurate interpretation is:
+
+- the run only covered the training + preview stage
+- the guidance default was effectively off (`guidance_scale_default = 0.0`)
+- the model config drifted away from the practical V4 reference
+- the archive therefore does not answer the intended V4a question about whether sampling-time nonlocal CA guidance helps collapse
+
+### Working conclusion
+
+The main value of this archive is diagnostic:
+
+- V4a notebook plumbing for additional compactness analysis is present
+- but this specific run is not yet the decisive anti-collapse experiment
+
+The next clean V4a attempt should preserve the working V4 reference first:
+
+- `hidden_dim = 192`
+- `sequence_offset_edges = (8, 16)`
+- same V4 objective and optimizer settings
+
+Then V4a should differ only by:
+
+- extra compactness diagnostics
+- explicit baseline-vs-guided sampling conditions
+- saved nonlocal-distance / close-contact comparison tables
+
+Until that is done, this archive should be treated as an early V4a smoke run rather than a conclusive collapse-mitigation result.
+
+## V4a first full guided-sampling comparison: guidance effect is real but extremely small
+
+Reviewed archive:
+
+- `results/v4a-20260608T001606Z-3-001.zip`
+
+This is the first V4a archive that actually contains the intended guided-sampling outputs:
+
+- `v4a_guidance_comparison_summary`
+- `v4a_nonlocal_sequence_separation_summary`
+- `v4a_global_diagnostics_*`
+- per-condition `v4a_condition_*_eval_metrics`
+
+### Configuration used
+
+Saved run config:
+
+- `model_hidden_dim = 192`
+- `model_sequence_offset_edges = 8,16`
+- `learning_rate = 1e-3`
+- `grad_clip_norm = 1.0`
+- `lambda_bond = 0.01`
+- `lambda_ca = 0.01`
+- `guidance_sequence_separation_default = 8`
+- `guidance_threshold_angstrom_default = 10.0`
+- `guidance_scale_default = 6e-4`
+- `guidance_start_timestep_default = 75`
+- `guidance_end_timestep_default = 10`
+
+So the V4a analysis finally ran on the intended practical V4 baseline architecture.
+
+### Training-side status
+
+The denoiser itself still looks healthy:
+
+- best validation total loss about `0.1375`
+- best validation noise about `0.1329`
+- test total about `0.1386`
+- test noise about `0.1340`
+- validation/test predicted-noise RMS about `0.95`
+
+This again supports the interpretation that the remaining issue is not training collapse of the denoiser, but global structure collapse during sampling.
+
+### Baseline versus guided compactness results
+
+The strongest result from this archive is also the most sobering:
+
+- the guided conditions moved the global compactness metrics in the desired direction
+- but the effect size is extremely small
+
+Baseline (`baseline_v4`) summary:
+
+- collapse count: `29/32`
+- poor adjacent-CA-band count: `32/32`
+- radius of gyration mean: `7.8017`
+- radius of gyration median: `7.8272`
+- max pairwise CA distance mean: `27.7737`
+- end-to-end CA distance mean: `15.3426`
+- fraction nonlocal CA pairs below `8A`: `0.310184`
+- fraction nonlocal CA pairs below `10A`: `0.487422`
+
+Strongest guided condition tested (`guided_thr10_scale1e-3`):
+
+- collapse count: `29/32`
+- poor adjacent-CA-band count: `32/32`
+- radius of gyration mean: `7.8064`
+- radius of gyration median: `7.8352`
+- max pairwise CA distance mean: `27.7807`
+- end-to-end CA distance mean: `15.3478`
+- fraction nonlocal CA pairs below `8A`: `0.309481`
+- fraction nonlocal CA pairs below `10A`: `0.486625`
+
+So the direction is technically correct:
+
+- radius increases slightly
+- end-to-end distance increases slightly
+- max pairwise CA distance increases slightly
+- nonlocal close-contact fractions decrease slightly
+
+But the magnitude is tiny:
+
+- collapse count unchanged
+- poor adjacent-CA-band count unchanged
+- nonlocal compactness metrics improve only at the third decimal place
+
+### Interpretation
+
+This archive is useful because it rules out one important possibility:
+
+- a small sampling-time nonlocal CA repulsion does **not** produce a meaningful anti-collapse effect by itself
+
+That does not mean the V4a idea is wrong. It means the current intervention is too weak, too indirect, or both.
+
+The most likely explanations are:
+
+1. the current guidance scales are still too small relative to the DDPM update magnitude
+2. the repulsion term is too diffuse because it averages over many nonlocal pairs
+3. the reverse process may already be committed to compact structures before the current guidance meaningfully changes the trajectory
+4. radius/global extent is still underconstrained at training time, so sampling-time guidance alone has limited leverage
+
+### Practical conclusion for next iteration
+
+This result does **not** justify running more epochs of the same training setup just to solve collapse.
+
+Why:
+
+- the guidance experiment reuses the checkpoint
+- the failure mode is still in generated global structure
+- the current evidence suggests the bottleneck is intervention strength/logic, not lack of denoiser convergence
+
+So the better next step is:
+
+- do **not** prioritize more epochs first
+- do **not** change the core V4 training hyperparameters again yet
+- instead, strengthen or redesign the collapse intervention itself
+
+### Recommended next direction
+
+The cleanest next tests should be one of:
+
+1. a much stronger sampling-time guidance sweep
+
+- try substantially larger scales than `1e-3`
+- potentially test `3e-3` or even `1e-2` very carefully
+- possibly start guidance earlier in the reverse process
+
+2. a more targeted global penalty
+
+- instead of a weak averaged nonlocal repulsion over many pairs
+- use a sharper penalty on the worst close-contact tail
+- or target per-structure compactness statistics more directly
+
+3. only after that, consider a new training-time global loss
+
+- but avoid simply resurrecting the old V3c radius hinge unchanged
+- if a training-time intervention is added, it should be more diagnostic and global-distance-aware than a crude radius threshold alone
+
+### Working judgment
+
+V4a first-iteration result:
+
+- excellent diagnostic progress
+- clear evidence that the existing anti-collapse guidance is too weak to matter materially
+- no evidence yet that more epochs of the same setup would solve the collapse problem
+
+So the next iteration should be a **stronger or sharper collapse intervention**, not just longer training.
+
+## V4a aggressive upper-bound sweep: stronger guidance finally moves collapse, but only modestly
+
+Reviewed archive:
+
+- `results/v4a-20260608T003204Z-3-001.zip`
+
+This run finally tested a genuinely more aggressive sampling-time anti-collapse sweep:
+
+- baseline
+- `guided_thr10_scale1e-3`
+- `guided_thr12_scale3e-3`
+- `guided_thr14_scale1e-2`
+
+Default run config:
+
+- `hidden_dim = 192`
+- `sequence_offset_edges = (8, 16)`
+- `guidance_threshold_angstrom_default = 12.0`
+- `guidance_scale_default = 3e-3`
+- `guidance_start_timestep_default = 75`
+- `guidance_end_timestep_default = 10`
+
+### Training-side status remains healthy
+
+The denoiser is still behaving well:
+
+- best validation total about `0.1361`
+- best validation noise about `0.1319`
+- test total about `0.1370`
+- test noise about `0.1328`
+
+So again, the remaining limitation is not obvious training instability.
+
+### Stronger guidance does finally matter
+
+This is the first V4a result where the stronger sampling-time guidance produces a clearly visible movement in the global compactness metrics.
+
+Baseline (`baseline_v4`) summary:
+
+- collapse count: `26/32`
+- poor adjacent-CA-band count: `32/32`
+- radius of gyration mean: `7.9069`
+- radius of gyration median: `7.9997`
+- max pairwise CA distance mean: `28.7562`
+- end-to-end CA distance mean: `15.7018`
+- fraction nonlocal CA pairs below `8A`: `0.301575`
+- fraction nonlocal CA pairs below `10A`: `0.476021`
+
+Most aggressive condition (`guided_thr14_scale1e-2`) summary:
+
+- collapse count: `20/32`
+- poor adjacent-CA-band count: `32/32`
+- radius of gyration mean: `8.0617`
+- radius of gyration median: `8.1115`
+- max pairwise CA distance mean: `29.0326`
+- end-to-end CA distance mean: `15.8969`
+- fraction nonlocal CA pairs below `8A`: `0.283823`
+- fraction nonlocal CA pairs below `10A`: `0.454770`
+
+So compared with the earlier weak sweep, the stronger settings finally produce a nontrivial global expansion signal:
+
+- collapse count improves from `26` to `20`
+- radius of gyration increases by about `0.155`
+- max pairwise CA distance increases by about `0.276`
+- end-to-end CA distance increases by about `0.195`
+- nonlocal close-contact fractions drop by a visible amount
+
+### But the effect is still limited
+
+Even with the strongest tested condition:
+
+- `20/32` structures are still flagged as collapsed
+- `32/32` still fail the adjacent-CA-band quality threshold in this V4a evaluation
+- the nonlocal distance distribution is still far from real structures
+
+Real reference at sequence separation `> 8`:
+
+- fraction nonlocal CA pairs below `8A`: `0.015950`
+- fraction nonlocal CA pairs below `10A`: `0.043257`
+- pooled nonlocal CA distance mean: `23.793`
+
+Best guided condition:
+
+- fraction nonlocal CA pairs below `8A`: `0.295817`
+- fraction nonlocal CA pairs below `10A`: `0.468807`
+- pooled nonlocal CA distance mean: `10.720`
+
+So although guidance is helping, the model is still producing structures that are globally far too compact.
+
+### Interpretation
+
+This run clarifies the situation:
+
+1. the current V4a guidance mechanism is capable of pushing structures outward
+2. guidance scale was indeed previously too low
+3. but even a much stronger repulsion does not come close to fixing the compactness gap
+
+That strongly suggests something else is also at play:
+
+- the reverse process has a structural prior toward compact states that guidance alone only partially counteracts
+- the current repulsion energy is still too diffuse because it averages over many nonlocal pairs
+- and/or the denoiser itself has not learned a sufficiently realistic global shape prior
+
+### Practical next-step conclusion
+
+This run argues **against** simply increasing epochs first.
+
+Why:
+
+- the denoiser is already stable
+- stronger guidance can move the samples
+- but the remaining compactness gap is still large even with aggressive scales
+
+So the next improvement should probably **not** be "same model, more epochs".
+
+The more promising next directions are:
+
+1. sharpen the guidance logic
+
+- penalize the worst close-contact tail more aggressively instead of averaging over all too-close pairs
+- consider a barrier-style or quantile-focused energy
+
+2. consider adding a training-time global loss
+
+- not the old crude V3c radius hinge unchanged
+- but something that explicitly teaches a less compact nonlocal distance distribution
+
+3. use the current aggressive sweep as an upper-bound probe
+
+- it shows the mechanism can work
+- but also shows that simple scale increases alone are unlikely to fully solve collapse
+
+### Working judgment
+
+The data no longer supports "guidance scale is definitely too low" as the whole story.
+
+A stronger scale helped, but not enough.
+
+So the next real improvement should come from **changing the shape of the anti-collapse objective/intervention**, not just turning the same knob further.
+
+## V4a more aggressive sweep: stronger guidance now gives a noticeable collapse reduction
+
+Reviewed archive:
+
+- `results/v4a-20260608T003204Z-3-001.zip`
+
+This run increased the sweep further:
+
+- `guided_thr10_scale1e-3`
+- `guided_thr12_scale3e-3`
+- `guided_thr14_scale1e-2`
+
+### Core result
+
+This is the first V4a run where the strongest guided condition produces a clearly nontrivial collapse improvement, not just a third-decimal movement.
+
+Baseline (`baseline_v4`):
+
+- collapse count: `26/32`
+- radius of gyration mean: `7.9069`
+- radius of gyration median: `7.9997`
+- max pairwise CA distance mean: `28.7562`
+- end-to-end CA distance mean: `15.7018`
+- fraction adjacent CA in band mean: `0.5851`
+- bond-target MAE mean: `0.1341`
+- fraction nonlocal CA pairs below `8A`: `0.301575`
+- fraction nonlocal CA pairs below `10A`: `0.476021`
+
+Strongest condition (`guided_thr14_scale1e-2`):
+
+- collapse count: `20/32`
+- radius of gyration mean: `8.0617`
+- radius of gyration median: `8.1115`
+- max pairwise CA distance mean: `29.0326`
+- end-to-end CA distance mean: `15.8969`
+- fraction adjacent CA in band mean: `0.5858`
+- bond-target MAE mean: `0.1328`
+- fraction nonlocal CA pairs below `8A`: `0.283823`
+- fraction nonlocal CA pairs below `10A`: `0.454770`
+
+### What improved
+
+Compared with baseline:
+
+- collapse count improved from `26` to `20`
+- radius of gyration mean improved by about `0.155`
+- max pairwise CA distance mean improved by about `0.276`
+- end-to-end CA distance mean improved by about `0.195`
+- fraction nonlocal CA pairs below `8A` improved by about `0.0178`
+- fraction nonlocal CA pairs below `10A` improved by about `0.0213`
+
+That is finally a visible anti-collapse effect.
+
+### What did not improve enough
+
+Even with the strongest condition:
+
+- `20/32` chains are still classified as collapsed
+- the compactness gap versus real structures remains huge
+- the model is still massively overpopulating short nonlocal CA distances
+
+Real reference at sequence separation `> 8`:
+
+- fraction nonlocal CA pairs below `8A`: `0.015950`
+- fraction nonlocal CA pairs below `10A`: `0.043257`
+- pooled nonlocal CA distance mean: `23.793`
+
+Best guided V4a condition:
+
+- fraction nonlocal CA pairs below `8A`: `0.295817`
+- fraction nonlocal CA pairs below `10A`: `0.468807`
+- pooled nonlocal CA distance mean: `10.720`
+
+So the anti-collapse guidance is now clearly helping, but the generative distribution is still far from realistic global geometry.
+
+### Important interpretation
+
+This run strongly suggests that two things are true at once:
+
+1. stronger guidance was necessary
+2. stronger guidance alone is still not sufficient
+
+That means something deeper is at play than just "the scale was too low".
+
+Most likely:
+
+- the model prior itself still prefers overly compact structures
+- the current guidance energy is still too averaged and diffuse
+- a nontrivial fraction of the reverse trajectory may already be locked into compact states before this correction can fully unwind them
+
+### What this implies for next iteration
+
+This result does not justify simply increasing epochs first.
+
+It also weakens the case for endlessly increasing the same guidance scale, because:
+
+- stronger guidance now clearly works
+- but even at `14A / 1e-2` the improvement is only partial
+
+So the next step should probably be:
+
+- keep the insight that stronger guidance helps
+- but change the intervention **shape**, not only the magnitude
+
+The most promising next move is:
+
+- replace the current averaged repulsion with a sharper close-contact penalty
+- for example, focus on the worst nonlocal contacts or the lower-distance tail rather than averaging all too-close pairs together
+
+Only after trying that should a new training-time global loss be considered.
+
+### Working judgment
+
+This V4a sweep is important because it shows the anti-collapse guidance is not a dead end.
+
+However, it is also strong evidence that the current formulation is too blunt.
+
+The next improvement should come from a **more targeted anti-collapse energy**, not from more epochs of the same setup.
+
+## V4c implementation note: tail-focused anti-collapse guidance and current notebook bottleneck
+
+The next notebook branch was split out as V4c rather than continuing to mutate V4a in place. The reason was methodological rather than cosmetic:
+
+- V4 should remain the working architecture/training reference
+- V4a should remain the first global-diagnostics plus simple-guidance branch
+- V4c should isolate the next intervention: a sharper sampling-time anti-collapse energy
+
+V4c therefore keeps the same working V4 training setup and checkpoint-loading path, but replaces the old averaged nonlocal repulsion with a tail-focused guidance option.
+
+### V4c intervention that was added
+
+The key new idea in V4c is that the old guidance energy was likely too diffuse. It averaged too many nonlocal close-contact violations together, so even large guidance scales only weakly emphasized the worst compactness failures.
+
+V4c therefore adds a new guidance mode:
+
+- `tail_topk_barrier`
+
+Conceptually this does the following:
+
+- compute nonlocal CA-CA close-contact violations
+- keep only the positive violations
+- focus only on the worst fraction of them, rather than all of them equally
+- apply a steeper barrier-style penalty to that worst-contact tail
+
+The intent is to make the sampling correction act more like "push apart the worst illegal contacts first" instead of "slightly raise the average spacing of all too-close nonlocal pairs."
+
+This is a more targeted anti-collapse intervention than the V4a mean-hinge style guidance.
+
+### Current V4c practical issue
+
+The newest blocker is not obviously model instability. It looks like a notebook-level memory problem.
+
+On the VM currently being used, system RAM reached about `11.5 / 12.7 GB` and the notebook effectively could not get through the first full evaluation cycle cleanly. The important observation is that this appears to be **CPU RAM pressure**, not primarily GPU memory exhaustion.
+
+Why that diagnosis is plausible:
+
+- V4c does not only train the denoiser
+- it also evaluates multiple guided sampling conditions in one pass
+- for each condition it keeps generated coordinates, per-structure diagnostic tables, and pooled nonlocal distance arrays
+- it then recomputes and concatenates additional pairwise-distance summaries across conditions
+
+So the most likely cause is that the notebook is holding too much evaluation state in memory at once.
+
+This is especially plausible because V4c currently does all of the following together:
+
+- baseline sampling
+- multiple guided-condition sampling runs
+- full global compactness diagnostics
+- pooled nonlocal CA distance summaries
+- per-condition saved tables
+- aggregate comparison tables
+
+That is a poor fit for a small `~13 GB` RAM VM even if the GPU itself is acceptable.
+
+### Important interpretation of the RAM issue
+
+This should not be misread as:
+
+- "the V4 model is too big"
+- "the EGNN is broken again"
+- "we necessarily need a better GPU first"
+
+The evidence so far points more toward:
+
+- the V4/V4a/V4c checkpoint path is workable
+- the anti-collapse experimentation is now bottlenecked by notebook evaluation design and memory usage
+
+An H100 would help throughput, but it would not by itself fix an avoidable CPU-memory blowup from storing too many per-condition tensors and pooled distance arrays simultaneously.
+
+### Concrete suggestions to fix the V4c notebook bottleneck
+
+The first fixes should be pragmatic and low-risk:
+
+1. reduce sample count for guidance comparison
+
+- default `V4C_SAMPLE_COUNT` should be cut substantially for triage
+- for example, from `32` down to `8` or `12`
+
+2. reduce sampling batch size
+
+- lower `V4C_SAMPLE_BATCH_SIZE`
+- for example, from `8` to `4`
+
+3. reduce the default number of guidance conditions
+
+- do not run a large sweep by default on a small VM
+- baseline plus one representative sharp-tail condition is enough for the next quick decision
+
+4. stop storing full generated coordinates for every condition unless explicitly needed
+
+- compute condition metrics
+- save condition outputs
+- release large tensors before moving on
+
+5. avoid retaining pooled nonlocal distance arrays for every condition at once
+
+- summarize them per condition
+- write the summary
+- free the raw arrays
+
+6. if needed, set notebook dataloader workers conservatively on small VMs
+
+- worker count is probably not the main bottleneck
+- but reducing worker/process overhead is still sensible on low-RAM machines
+
+### Working judgment on V4c so far
+
+V4c is still the right conceptual next step.
+
+The previous V4a results already showed:
+
+- stronger guidance can reduce collapse somewhat
+- but average repulsion alone is too blunt
+
+So testing a sharper tail-focused barrier is justified.
+
+The current obstacle is mostly operational:
+
+- V4c needs to be made lighter and more sequential in how it evaluates conditions
+
+That should be done before drawing scientific conclusions from failed or incomplete V4c runs on constrained hardware.
+
+## One-day plan for the final project window
+
+There is effectively one productive day left, so the goal should not be "explore everything." It should be to produce one clean, defensible final result and one clean next-step recommendation.
+
+### Main objective for the final day
+
+Produce a compact, reproducible V4c result that answers:
+
+- does tail-focused guidance improve collapse metrics more than the V4a mean-guidance baseline
+- without obviously destroying local backbone quality
+
+That is a concrete and reportable question.
+
+### Recommended plan
+
+1. simplify V4c so it can run reliably on available hardware
+
+- reduce default sample count
+- reduce default sample batch size
+- reduce default condition sweep to:
+  - `baseline_v4`
+  - one legacy mean-guidance comparison
+  - one representative tail-guidance comparison
+
+2. rerun V4c from the existing good V4 checkpoint rather than retraining
+
+- no more architecture retraining unless absolutely necessary
+- the remaining question is sampling-time collapse control
+
+3. evaluate only the most decision-relevant outputs
+
+- collapse count
+- radius of gyration
+- max pairwise CA distance
+- end-to-end CA distance
+- fraction nonlocal CA pairs below `8A`
+- fraction nonlocal CA pairs below `10A`
+- adjacent CA in-band fraction
+- bond-target MAE
+
+4. choose one final conclusion
+
+Either:
+
+- tail-focused guidance is a real improvement over mean guidance and should be presented as the best current anti-collapse intervention
+
+or:
+
+- even sharper sampling-time guidance only partially helps, which supports the conclusion that a future training-time nonlocal/global objective is needed
+
+Both conclusions are scientifically usable. The failure mode is now measurable and the intervention path is clear.
+
+### What should not be done in the final day
+
+- do not restart broad architecture tuning
+- do not spend the last day rerunning many-epoch training just to chase validation loss
+- do not add a large new training-time loss unless V4c becomes completely unworkable
+
+### Best-case end-of-project outcome
+
+The best realistic final outcome is:
+
+- V4 remains the validated architecture improvement over V3b for structural sample quality
+- V4a shows that simple nonlocal guidance helps only weakly
+- V4c shows whether a sharper tail-focused guidance improves collapse more meaningfully
+- the report can then conclude with a clear and defendable next-step recommendation:
+  - future work should target global nonlocal compactness more directly, likely with a sharper sampling-time control or a training-time nonlocal structural objective
+## Review: stop, diagnose, and restart V4d with a clearer collapse hypothesis.
+
+This review was added after stepping back from the V4, V4a, and V4c collapse-control attempts. The purpose is to separate what has genuinely improved from what is still failing, so the next experiment is methodical rather than another blind hyperparameter tweak.
+
+### Current model framing.
+
+The current V4 line is best described as a DDPM-style backbone-coordinate diffusion model with an EGNN-style coordinate-aware denoiser. The diffusion process is still the generative framework: clean backbone coordinates are noised, the model predicts the added noise, and sampling starts from Gaussian noise before iteratively denoising. The EGNN-style network is the denoiser inside that framework.
+
+### What V4 fixed.
+
+V4 is not a failed branch. It is the strongest structural branch so far.
+
+Relative to the 100-epoch stable V3b reference, V4 improved the generated structural metrics that mattered most for local sample quality:
+
+| Metric | V3b 100 ep | V4 reference |
+|---|---:|---:|
+| Adjacent Cα mean | 3.162 Å | 3.740 Å |
+| Adjacent Cα in-band fraction | 0.728 | 0.859 |
+| Radius of gyration | 7.855 Å | 8.348 Å |
+| Collapse count | 19/32 | 10/32 |
+| Poor Cα-band count | 18/32 | 5/32 |
+
+The important interpretation is that V4 improved the sample geometry despite not having the best pure denoising loss. V3b remains stronger on validation noise loss, but V4 produces better generated structures. Therefore, downstream structural metrics are more informative than noise loss alone for this project.
+
+### What remains wrong.
+
+The remaining failure is now more specific. Earlier versions had both broken local trace geometry and global collapse. V4 substantially improves local Cα continuity and bond-like geometry, but the samples are still globally too compact.
+
+The real validation-shaped structures have a mean radius of gyration around 16.2 Å, whereas V4 generated samples remain around 8.35 Å. This means V4 sits close to the collapse threshold even when the adjacent Cα trace looks much better.
+
+This suggests the model has learned a better local backbone but has not learned the correct nonlocal/global spatial distribution.
+
+### Why the current objective is incomplete.
+
+The current local geometry objective penalises:
+
+- intra-residue `N-CA` distance.
+- intra-residue `CA-C` distance.
+- intra-residue `C-O` distance.
+- adjacent-residue `C-N` distance.
+- adjacent `CA-CA` distance.
+
+These terms are useful, but they mainly teach local backbone continuity and local stereochemical plausibility. They do not directly teach the model how far apart sequence-distant residues should be in 3D space.
+
+This is the core missing signal. The model can make a locally plausible chain that is still globally over-compressed.
+
+### Diagnosis versus fix.
+
+Distance maps and contact maps should first be used as diagnostics, not immediately as a new dense training target.
+
+For generated samples, it is not fair to expect one generated contact map to match one exact validation contact map, because the model is sampling unconditionally with validation-shaped masks rather than reconstructing a specific validation fold. The fairer question is whether generated samples have distance/contact-map statistics that resemble real structures of similar length.
+
+Useful diagnostics now include:
+
+- Cα distance maps for a few real and generated examples.
+- Cα contact maps at 8 Å and 10 Å.
+- Nonlocal contact fractions for sequence separations such as `|i-j| > 8`, `>16`, and `>32`.
+- Reverse-trajectory compactness summaries to see when collapse appears during sampling.
+
+These diagnostics should make the remaining failure visually and quantitatively clear: generated structures overpopulate short nonlocal Cα distances.
+
+### Why not use full contact-map training immediately.
+
+A full contact-map loss is not the best next step. Contact maps bin continuous distances into contact/non-contact labels, which loses useful information. A pair at 9 Å and a pair at 30 Å are both non-contacts at an 8 Å threshold, but they mean very different things for global fold extent.
+
+A full distance-map loss is more informative but may be expensive and over-constraining if applied densely across all residue pairs.
+
+The more controlled next step is sparse nonlocal Cα distance supervision.
+
+### V4d hypothesis.
+
+V4d should keep the V4 architecture and stable local geometry objective, then add a small sparse nonlocal Cα distance loss during training.
+
+The intended training objective is:
+
+```text
+noise_mse
++ 0.01 * local_bond_geometry_loss
++ 0.01 * adjacent_ca_geometry_loss
++ lambda_nonlocal_ca * sparse_nonlocal_ca_distance_loss
+```
+
+The new sparse nonlocal term should:
+
+- compare predicted clean `x0_pred` Cα-Cα distances against true clean `x0` Cα-Cα distances.
+- use only valid residue pairs.
+- use only sequence-distant pairs, initially `|i-j| > 8`.
+- sample a limited number of pairs per batch, for example 512 to 2048.
+- use Smooth L1 loss rather than plain MSE.
+- start with a small weight, for example `lambda_nonlocal_ca = 0.002`.
+- apply mainly at mid/high timesteps, for example `t >= 25`, because global structure formation is a mid/high-noise problem.
+
+This is more principled than a radius hinge because it does not force every protein toward one generic radius. It teaches the model the nonlocal distance pattern of the actual clean training example.
+
+### What V4d should prove or disprove.
+
+V4d should answer one focused question:
+
+```text
+Can sparse nonlocal Cα distance supervision reduce global over-collapse while preserving the local geometry gains of V4?
+```
+
+The primary comparison should be V4d versus V4, not only V4d versus V3b.
+
+Success would mean:
+
+- collapse count drops below V4's 10/32.
+- radius of gyration increases above V4's approximately 8.35 Å.
+- nonlocal Cα close-contact fractions decrease.
+- adjacent Cα in-band fraction remains close to the V4 value of approximately 0.86.
+- bond means do not degrade severely.
+- validation/test noise loss remains stable enough to trust the model.
+
+A negative result would still be useful if it shows that sparse nonlocal supervision either fails to move global compactness or damages local geometry. That would support a future shift towards sharper sampling-time guidance or a richer global structure prior.
+
+### Immediate coding direction.
+
+The next notebook should be `protein_backbone_diffusion_v4d.ipynb`, copied from V4. It should preserve the V4 denoiser and local geometry losses, set `results/v4d/` as the artifact output, add sparse nonlocal Cα distance supervision to the training and fixed-timestep evaluation loops, and add reverse-trajectory collapse diagnostics plus lightweight Cα distance/contact-map figures.
+
+This is the most defensible next experiment because it directly targets the remaining failure mode rather than increasing local geometry losses, adding sequence conditioning, or continuing to tune radius penalties blindly.
+
+## Review: V4d sparse nonlocal Cα supervision.
+
+At this stage, the most useful decision is to stop and separate what has been fixed from what remains unsolved.
+
+The current best modelling line is the V4 family: a DDPM-style backbone-coordinate diffusion model with an EGNN-style coordinate-aware denoiser. V4 was a major improvement over the earlier V3b geometry-aware baseline. It preserved much stronger local backbone geometry, improved adjacent Cα spacing, reduced poor Cα-band failures, and reduced collapse compared with the previous flattened denoiser. However, V4 still remained globally over-compact: generated structures had radius of gyration around 8 Å, compared with around 16 Å for real validation structures.
+
+This motivated V4d. The purpose of V4d was not to redesign the architecture again, but to test whether the remaining collapse problem could be addressed more directly with sparse nonlocal Cα distance supervision. The idea was that local geometry losses teach the model how to form a continuous backbone trace, but they do not teach the model enough about the distribution of distances between residues far apart in sequence. V4d therefore preserved the V4 local geometry objective and added a small additional Smooth L1 loss comparing predicted clean Cα–Cα distances against true clean Cα–Cα distances for randomly sampled nonlocal residue pairs.
+
+The 200-epoch overfit-debug run was useful as a stress test. It showed that the nonlocal Cα objective is active and learnable. The model could strongly reduce the nonlocal distance loss and push structures out of the collapsed regime. However, the same run also showed an important failure mode: if the nonlocal objective dominates on a tiny repeated subset, the model can over-expand structures and destroy local backbone continuity. The generated structures became globally spread out, but adjacent Cα distances and backbone bond lengths became unrealistic. This proved that the intervention has power, but also that it needs to be balanced carefully.
+
+The full-data 30-epoch V4d run was therefore the more important experiment. It trained normally: validation total and noise losses decreased, predicted-noise RMS stayed healthy, and the model did not collapse into a trivial predictor. The local geometry terms improved strongly during training, especially the adjacent Cα loss and bond-length loss. In contrast, the sparse nonlocal Cα loss decreased only modestly. This suggests that the nonlocal supervision was active, but too weak or too indirect to dominate the learned reverse process.
+
+Structurally, V4d was much better than the earlier V3b baseline, but it did not beat the current V4 reference. It preserved strong local backbone quality and reduced poor Cα-band failures, but it did not improve global compactness relative to V4. Radius of gyration remained around 8 Å rather than moving toward the real mean around 16 Å, and collapse count was worse than the V4 reference. The generated structures were not too stretched out; they were still under-expanded compared with real structures.
+
+The reverse-trajectory diagnostics helped clarify the failure mode. During sampling, radius of gyration and adjacent Cα quality improved as denoising progressed. The model did not appear to collapse late. Instead, it started from a globally compact configuration and gradually cleaned up local geometry, but plateaued at a radius that was still much smaller than real proteins. This supports the interpretation that the low-noise local geometry regime is good at repairing backbone continuity, but does not create realistic global extent by itself.
+
+The key conclusion from V4d is therefore mixed but valuable. Sparse nonlocal Cα distance supervision is conceptually well-motivated and learnable, but the current weak implementation does not overcome the compact global prior of the generator. Increasing the nonlocal signal too much can also damage local geometry, as shown by the overfit-debug run. The next improvement should therefore not be another blind architecture change or an aggressive radius penalty. It should be a controlled test of stronger, better-timed global supervision, ideally applied mainly in the high-noise or mid-noise regime where global structure is being formed, while keeping the low-noise regime focused on local backbone refinement.
+
+For the final write-up, V4 remains the strongest current model. V4d should be presented as a thoughtful follow-up experiment: it diagnosed the remaining collapse problem as a nonlocal/global geometry issue, tested a targeted intervention, and showed that weak sparse nonlocal supervision alone is insufficient. This is still useful scientific progress because it narrows the next-step hypothesis: future work should target global compactness more directly, but without sacrificing local backbone validity.
+
+## Review: V4e and V4f contact-tail experiments.
+
+After V4d showed that exact sparse nonlocal Cα distance matching had limited benefit, I tested two softer contact-tail objectives to target the remaining collapse problem more directly.
+
+V4e replaced exact nonlocal distance matching with a soft nonlocal contact-tail loss. Instead of asking the model to match exact Cα–Cα distances between sequence-distant residues, V4e compared soft contact fractions at 8 Å and 10 Å. This was inspired by the idea that collapse is visible as an excess of short nonlocal contacts, rather than every long-range distance being equally wrong. V4e did move the nonlocal compactness metrics in the right direction: mean nonlocal Cα distance increased slightly, short nonlocal contact fractions decreased, and collapse count improved relative to the weaker V4d run. However, this came at a clear cost to local backbone continuity. Adjacent Cα in-band fraction dropped substantially, and poor Cα-band failures increased. Therefore, V4e supported the diagnosis that collapse is a global/nonlocal problem, but it did not provide a better final model than V4.
+
+V4f then refined the contact-tail idea into a one-sided excess-contact loss. The aim was to penalise the model only when it produced too many short nonlocal Cα contacts relative to the real structure, rather than symmetrically matching contact fractions. This was intended to avoid punishing legitimate tertiary contacts. However, the generated samples were worse than V4 and worse than V4e. The excess-contact loss remained very small during training, and it did not transfer into better free sampling. Collapse count increased, adjacent Cα in-band fraction fell, and all generated samples failed the poor Cα-band criterion.
+
+The combined lesson from V4d, V4e, and V4f is that training-time global/nonlocal losses have some conceptual leverage, but they are not transferring cleanly into better iterative samples. Exact nonlocal distance matching is too fold-specific and blunt; symmetric contact-tail matching moves the right metrics but damages local geometry; one-sided excess-contact matching is too weak in practice. The failure mode now appears less like “the loss is missing one more term” and more like “the free sampling process needs to be steered or constrained directly”.
+
+This motivates the next experiment: V4g should return to the best V4-style training objective and test sampling-time guidance/projection. Rather than adding another training loss, V4g will keep the trained denoiser fixed and compare standard reverse diffusion against lightweight sampling-time interventions that encourage length-aware global expansion while preserving local adjacent Cα geometry.
+
+## Review: V4f and V4g final intervention experiments.
+
+After V4e showed that a soft nonlocal contact-tail objective could move some global compactness metrics but damaged local Cα continuity, I tested V4f as a more targeted refinement. V4f used a one-sided excess-contact loss, penalising generated structures only when they produced too many short nonlocal Cα contacts relative to real structures. The aim was to avoid penalising legitimate tertiary contacts while still discouraging global collapse.
+
+The V4f result was a useful negative experiment. The model trained normally, but the excess-contact loss remained very small and did not transfer into better free sampling. Generated structures remained globally compact, collapse count worsened, and local adjacent Cα quality fell below the V4 reference. This suggested that the issue was no longer simply choosing the right nonlocal training loss. Across V4d, V4e, and V4f, training-time global/nonlocal losses had some conceptual leverage, but they did not reliably improve the iterative reverse-sampling process.
+
+This motivated V4g, which changed the intervention point from training time to sampling time. Instead of adding another global loss to the training objective, V4g returned to the stronger V4-style denoiser objective and tested lightweight sampling-time projection. This was inspired by the broader principle behind guided and conditioned diffusion methods: after training a denoiser, the sampling trajectory can be steered towards desired structural properties.
+
+V4g trained cleanly with the local V4 objective and then compared standard sampling against weak, medium, and strong projection conditions. The projection applied two simple corrections during reverse diffusion: a gentle radius-based expansion to discourage global collapse, and a later local Cα projection to preserve adjacent Cα spacing. This directly tested whether the remaining collapse problem was better addressed during sampling rather than through yet another training-time nonlocal loss.
+
+The V4g results were the strongest intervention result so far. The medium projection setting gave the best balance. It substantially reduced collapse count, increased radius of gyration, increased mean nonlocal Cα distance, and reduced the fraction of short nonlocal Cα contacts, while preserving or slightly improving adjacent Cα in-band quality. This was the first intervention that clearly improved global compactness without the local-geometry trade-off seen in V4d, V4e, and V4f.
+
+V4g does not fully solve protein generation. Even the medium projection samples remain more compact than real validation structures, and the approach is heuristic rather than a learned generative prior. However, it provides a clear and useful conclusion: the trained V4 denoiser can produce good local backbone geometry, but the free sampling trajectory is biased towards overly compact structures. Sampling-time projection can partially correct this bias more effectively than the nonlocal training losses tested here.
+
+For the final write-up, I will treat V4g with medium projection as the strongest practical result. The plain V4/V4g denoiser remains the core learned model, while the V4g projection experiment is reported as a lightweight sampling-time intervention that improves global compactness while preserving local backbone quality.
+
+
+## Independent review (2026-06-09): the terminal-SNR root cause and a final-day intervention menu
+
+This section is a second-opinion review added on the last day before the final write-up. It reads the saved diagnostics and the code directly rather than the version narrative above. Its purpose is to name a root cause the V1–V4g trajectory did not identify, and to lay out a ranked set of interventions that can still be tried today.
+
+### The missed root cause: non-zero terminal SNR
+
+The forward process uses the textbook linear DDPM schedule (`beta` 1e-4 → 2e-2 in `src/latent_structure_generation/backbone_diffusion.py::create_noise_schedule`), but it is run with `T = 100`. That schedule was designed for `T = 1000`. At `T = 100` the cumulative `alpha_bar_T = 0.364`, so `sqrt(alpha_bar_T) = 0.60`. In plain terms: even the *noisiest* training step still contains about 60 percent of the clean structure. The terminal signal-to-noise ratio is about 0.57, not ~0.
+
+This matters because every sampler starts generation from pure `N(0, I)` noise — a distribution the model never saw in training, where the noisiest example always retained 60 percent signal. The mismatch bakes in a contraction. Working the epsilon-prediction arithmetic at the terminal step, the first reverse step reconstructs `x0 ≈ 0.335 · x_T`. The prior cloud has Rg ≈ 20.3 Å (per-axis std ≈ [11.5, 11.5, 12.1] recovered from the checkpoint), so the first denoised structure already has Rg ≈ 20.3 × 0.335 ≈ 6.8 Å. The saved reverse-trajectory diagnostic starts at 6.46 Å and only climbs to ~8.2 Å. That match is the signature: roughly half the global collapse is manufactured by the schedule before the model expresses any learned preference.
+
+A one-line sanity check would have caught it: print `alpha_bar_T` (or terminal SNR) and confirm it is ~0, or plot a real structure noised to `t = T` and notice the fold is still visible. This is a well-known silent footgun (see Lin et al. 2023, "Common Diffusion Noise Schedules and Sample Steps are Flawed"), so it is a lesson rather than a failing — but it is the single highest-leverage thing to fix.
+
+### Why this re-explains the whole V4d–V4g story
+
+The trajectory above repeatedly added global/nonlocal losses at training time (V4d exact distances, V4e contact tails, V4f one-sided excess contacts) and found they "did not transfer" to free sampling. The terminal-SNR bug explains why, for two compounding reasons:
+
+1. The sampler always begins in a contracted basin (Rg ~6.5 Å). No training-time loss changes where sampling *starts*; it can only nudge the trajectory afterward, and the trajectory never had enough reverse "room" to re-expand to ~16 Å.
+2. Those nonlocal losses were applied mainly at mid/high noise, where the epsilon-model's `x0` estimate is least reliable — and, under this schedule, additionally contracted. The gradient they supplied was therefore weak and biased.
+
+So the conclusion "free sampling needs to be steered directly" (which motivated V4g) was reasonable given the evidence, but the deeper cause was upstream in the data pipeline. V4g's projection guidance worked precisely because it forcibly re-expands the contracted sample at sampling time — it is treating the symptom of the schedule bug, not the cause.
+
+One correction to the record while here: the saved `v4g_guidance_comparison_summary` table actually shows the **weak** projection setting giving the best balance (highest adjacent-CA in-band ≈ 0.885, lowest poor-CA-band count), not medium. The reviews above state medium is best. For the final write-up, weak is the more honest pick.
+
+### The primary fix (implemented as V4h)
+
+Switch to a cosine schedule (Nichol & Dhariwal 2021), which drives `alpha_bar_T` to ≈ 2.4e-7 (terminal SNR ≈ 0) without the divide-by-zero that an exact-zero epsilon-prediction setup would hit. `T = 100` is kept so the schedule *shape* is the only change, which keeps the fix attributable. This lives in `notebooks/protein_backbone_diffusion_v4h.ipynb`, otherwise a copy of V4g, writing to `results/v4h/`. Cosine and the full Lin et al. zero-terminal-SNR rescale solve the same problem; cosine is chosen because it does not also require switching to v-prediction and changing the sampler. Success criteria: mean generated Rg moving off ~8 Å toward ≥12–14 Å, collapse fraction falling, adjacent-CA in-band holding ≥0.85.
+
+### Additional interventions for the final day, ranked by benefit / risk / time
+
+The cosine fix removes the *manufactured* half of the collapse. The remaining gap (isotropic prior, no global supervision that transfers, limited receptive field) is what the items below target. They are tiered so the safe, cheap ones can be stacked today and the risky ones are explicitly flagged as future work.
+
+#### Tier 1 — safe to do today (cheap, low risk, stack freely)
+
+1. **More reverse steps with cosine (`TIMESTEPS = 250`).** *Why:* cosine's end-of-schedule betas are large (last few ≈ 0.55, 0.75, 0.999); more steps smooth the early reverse trajectory and give the sampler more room to expand. *Where:* the `TIMESTEPS` constant in the schedule cell of V4h; retrain (cosine is defined for any T). *Effort:* one constant + retrain. *Risk:* low. *Expected:* modest extra Rg and smoother samples on top of the cosine fix.
+
+2. **EMA of model weights for sampling.** *Why:* an exponential moving average of parameters is a standard, near-free diffusion quality boost and reduces sample-to-sample variance. *Where:* maintain `ema_state` in the training loop (`run_epoch` caller in the training cell), update each step with decay ≈ 0.999, and load EMA weights before the sampling/diagnostic cells. *Effort:* ~15 lines. *Risk:* low. *Expected:* small but reliable improvement in sample cleanliness.
+
+3. **Stack V4g weak projection on top of cosine.** *Why:* the cosine fix and the sampling-time projection are complementary — one removes the artificial contraction, the other corrects residual compactness. *Where:* already present in the guidance-comparison cell; run the `weak` condition against the cosine-trained checkpoint. *Effort:* none beyond running the cell. *Risk:* none; it is also the guaranteed fallback number. *Expected:* best end-to-end Rg of the available options.
+
+4. **Re-center and clamp `x0` during sampling.** *Why:* now that high-`t` `x0` estimates can be large (dividing by a tiny `sqrt(alpha_bar_t)`), a per-step center-of-mass re-centering plus a generous magnitude clamp on the predicted `x0` (a dynamic-thresholding analog) prevents drift and rare blow-ups. *Where:* the reverse loop in `sample_backbone` / the notebook samplers. *Effort:* a few lines. *Risk:* low. *Expected:* robustness, not a metric jump.
+
+5. **Cheap diagnostics that strengthen the writeup.** Add (a) a log Rg vs log N scaling plot comparing the generated slope to the real polymer exponent (~0.4, the Chroma scaling law) — this shows directly whether the model learned global scale; (b) real-vs-generated distogram/contact-map overlays; (c) a cosine-vs-linear A/B table of Rg, collapse fraction, and in-band. *Why:* these turn "I fixed a bug" into measured evidence. *Effort:* low (most helpers already exist). *Risk:* none.
+
+#### Tier 2 — high value, do at most ONE if time remains (moderate effort/risk)
+
+6. **Low-noise pairwise/distogram Cα loss (FrameDiff `L_2D` style).** *Why:* this is the principled version of what V4d/e/f attempted but mistimed. Apply a Smooth L1 loss on the full (or subsampled) pairwise Cα distance matrix of the predicted clean structure versus the true clean structure, gated to **low** timesteps only (e.g. `t ≤ 20`), where `x0_pred` is now reliable after the schedule fix. Unlike a scalar Rg penalty, a distogram supervises the entire global shape; unlike the V4d high-noise version, it acts where the gradient is trustworthy. *Where:* mirror `adjacent_ca_geometry_loss` in the training cell, build it from `x0_pred_to_angstrom_coords`, gate with a low-`t` mask, weight ≈ 0.01–0.05. *Effort:* ~30–40 lines. *Risk:* medium (start with a small weight to avoid the over-expansion seen in the V4d overfit run). *Expected:* the most likely single lever to push Rg from ~12–14 toward real.
+
+7. **Self-conditioning (RFdiffusion / Chen et al. 2022).** *Why:* feeding the model its own previous `x0` prediction is used in essentially every strong structure-diffusion system and materially stabilizes global geometry across reverse steps. *Where:* extend `BackboneCoordinateEGNNDenoiser.forward` to accept an optional prior-`x0` channel, and in training pass it with 50 percent probability (zeros otherwise). *Effort:* moderate (model + training loop). *Risk:* medium; more surface area than item 6. *Expected:* steadier trajectories and better global extent, but only attempt if item 6 is already done or skipped.
+
+#### Tier 3 — do NOT start today (high value, high risk; list as future work)
+
+8. **Spatial / k-NN edges in the EGNN graph.** Adding edges between spatial neighbours of the current `x_t` (not just fixed sequence offsets 8, 16) gives the denoiser a receptive field that can form tertiary contacts — the principled fix for the limited receptive field. But rebuilding the graph from coordinates each forward pass, with correct masking and equivariance, is too much to debug safely on the last day.
+
+9. **Chroma-style correlated polymer prior.** Sampling the initial noise from a correlated Gaussian whose covariance encodes chain connectivity (Rg ~ N^0.4) injects the right global scale at initialization and is arguably the deepest fix for the isotropic prior. But it must be applied consistently in both `q_sample` (training) and the sampler, so it is all-or-nothing and high risk for today.
+
+### What NOT to do on the final day
+
+Do not train past ~40 epochs — validation loss plateaued by epoch ~25 and the teacher-forced `x0_pred_rms` was already flat at the correct scale, so more epochs will not fix free-sampling collapse. Do not switch to `(4, 8, 16, 32)` sequence-offset edges — the notes already showed ~3× cost with no gain. Do not add more scalar radius/Rg penalties — V4d–V4f showed they do not transfer; prefer the low-noise distogram loss instead. Do not keep enlarging the guidance candidate count — that is cherry-picking and hides collapse rather than fixing it. Spend the day instead on the cosine retrain (V4h), then stack Tier 1 items, and add item 6 only if time allows.
+
+### If collapse still persists after V4h
+
+Frame it precisely and the work still reads as strong. The final write-up can state: local geometry is genuinely learned (adjacent Cα 3.74 vs 3.81 Å, in-band ≈ 0.86); the global collapse was traced to a non-zero terminal SNR (`alpha_bar_T = 0.36` at `T = 100`) with a quantitative prediction (0.335 contraction → 6.8 Å predicted vs 6.46 Å observed); the cosine schedule removes the manufactured contraction; and the remaining gap is attributable to the isotropic prior and the absence of transferable global supervision, with a concrete roadmap (low-noise distogram loss, self-conditioning, spatial edges, correlated prior) drawn from FrameDiff, RFdiffusion, and Chroma. A clear diagnosis with a measured partial fix is worth more than an unexplained lucky number.
+
+## Review: V4g, V4h, and V4i.
+
+V4g was the strongest practical result before the diffusion-schedule investigation. It kept the V4 EGNN-style denoiser and local geometry objective, then added sampling-time projection/guidance. The best V4g setting was the medium projection condition, which improved global compactness compared with baseline V4-style sampling while preserving adjacent Cα quality. This made V4g medium projection the best empirical model at that stage.
+
+A late review then identified a more foundational issue in the diffusion setup. V4g used `TIMESTEPS = 100` with a standard linear DDPM beta schedule. With only 100 steps, the terminal cumulative signal level remained high: `alpha_bar_T` was around `0.36`, so `sqrt(alpha_bar_T)` was around `0.60`. This means the noisiest training examples still contained substantial clean structural signal. However, sampling starts from pure Gaussian noise. This created a mismatch between the noisiest structures seen during training and the starting point used during generation.
+
+V4h tested a correction to this issue. It preserved the V4-style model and local geometry objective, but replaced the old 100-step linear schedule with a cosine-style schedule that drove the terminal signal level much closer to zero. This was technically motivated: the goal was to make the final training timestep more consistent with pure-noise sampling.
+
+The full V4h terminal sampler did not work. Starting from `t=100` produced physically exploded structures rather than plausible protein backbones. Radius of gyration became extremely large, adjacent Cα distances became impossible, and structure visualisation failed. Fixed-timestep diagnostics suggested why: at near-zero `alpha_bar`, the epsilon-prediction formula for reconstructing `x0_pred` becomes numerically fragile, so small prediction errors can be amplified into enormous coordinate errors. V4h therefore fixed the under-noising issue, but overcorrected into an unstable high-noise endpoint for this 100-step epsilon-prediction setup.
+
+To understand whether V4h was completely unusable or only failing at the extreme endpoint, I added a t-start sampling diagnostic. This tested reverse sampling from `t_start = 100, 90, 75, 50` without retraining. The diagnostic showed a clear pattern. Sampling from `t_start=100` still exploded. Sampling from `t_start=50` was too collapsed because the model had too little high-noise trajectory left to build global structure. Sampling from `t_start=75` gave acceptable local geometry but remained too compact. Sampling from `t_start=90` gave the best balance: the structures were much closer to real global scale, with radius of gyration around 14 Å, acceptable adjacent Cα in-band fraction, lower short nonlocal-contact fractions, and no collapse in the small diagnostic sample.
+
+This suggests that the V4h denoiser did learn useful high-noise behaviour, but the final near-zero-SNR endpoint was too unstable to use directly. V4i is therefore the next clean variant: it keeps the V4h cosine schedule but promotes truncated-start sampling from `t_start=90` as the default generation procedure.
+
+V4i should be interpreted honestly. It is not a perfect standard DDPM sampler from the full terminal prior, because it avoids the unstable `t=100` endpoint. However, it is a useful and scientifically motivated diagnostic/generation variant. It tests whether the corrected schedule can produce more realistic global structure when the numerically unstable endpoint is skipped. If the `t_start=90` result holds at a larger sample count, V4i may become the best final sampling result, especially because it substantially improves global compactness compared with V4g medium projection while retaining acceptable local Cα geometry.
